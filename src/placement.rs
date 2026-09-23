@@ -78,8 +78,9 @@ pub enum Decision {
     Power,
     Ground,
     Special,
-    /// `isPadNet`: a port straight to a pad — `makePadParasitic` (a 1 mΩ link, no capacitance).
-    Pad,
+    /// `isPadNet`: a port straight to a pad — `makePadParasitic` (a 1 mΩ link, no capacitance)
+    /// between the net's first two connected pins.
+    Pad { pins: Vec<PinLoc> },
     /// `isSkipPin(driver)`: an ideal clock.
     Skip,
     /// `makeSteinerTree` returned null: fewer than two pins, or one not placed. The pins as sorted.
@@ -97,9 +98,21 @@ pub struct NetEstimate {
 
 type Res<T> = Result<T, String>;
 
-/// The flat pins of a net in `connectedPinIterator` order: the instance terminals (`getITerms`),
-/// then the block terminals.
-fn connected_pins(db: &Db, net: &str) -> Vec<PinLoc> {
+/// `PinIdLess`: `dbNetwork::id(pin)` — an instance terminal's odb id × 2, a block terminal's × 2 + 1.
+pub fn pin_key(db: &Db, pin: &PinLoc) -> Res<u64> {
+    if pin.is_port {
+        Ok((u64::from(db.bterm_id(&pin.name).map_err(|e| e.to_string())?) << 1) | 1)
+    } else {
+        let (inst, term) = pin.name.rsplit_once('/').unwrap_or((&pin.name, ""));
+        Ok(u64::from(db.iterm_id(inst, term).map_err(|e| e.to_string())?) << 1)
+    }
+}
+
+/// The flat pins of a net in `connectedPinIterator` order — ⛔ a `PinSet`, so by `PinIdLess`
+/// ([`pin_key`]), not the database's instance-terminals-then-ports order. It decides `net2Pins`
+/// (the pad test and the pad resistor's direction) and the pins' order before `makeSteinerTree`'s
+/// (x, y) sort, hence ties at one location. (`getFirstDriverTerm` walks the database's own lists.)
+fn connected_pins(db: &Db, net: &str) -> Res<Vec<PinLoc>> {
     let mut out = Vec::new();
     for it in db.net_iterms(net) {
         let (inst, term) = it.rsplit_once('/').unwrap_or((&it, ""));
@@ -113,7 +126,14 @@ fn connected_pins(db: &Db, net: &str) -> Vec<PinLoc> {
         let status = db.bterm_get_first_pin_placement_status(&bt);
         out.push(PinLoc { name: bt.clone(), is_port: true, x, y, placed: matches!(status.as_str(), "PLACED" | "FIRM" | "LOCKED" | "COVER") });
     }
-    out
+    Ok(out)
+}
+
+/// [`connected_pins`] in `PinSet` order.
+fn connected_pins_by_id(db: &Db, net: &str) -> Res<Vec<PinLoc>> {
+    let mut keyed = connected_pins(db, net)?.into_iter().map(|p| pin_key(db, &p).map(|k| (k, p))).collect::<Res<Vec<_>>>()?;
+    keyed.sort_by_key(|(k, _)| *k);
+    Ok(keyed.into_iter().map(|(_, p)| p).collect())
 }
 
 /// `dbNetwork::drivers(net)` — ⛔ NOT OpenSTA's visitor over every driver: `dbNetwork` overrides it
@@ -180,11 +200,13 @@ pub fn estimate_wire_parasitics(db: &Db, timing: &Timing<'_>, alpha: f32, stt: S
 
 /// `estimateWireParasitic(net)`: the net's first driver, if it has one.
 fn estimate_wire_parasitic(db: &Db, timing: &Timing<'_>, clock_nets: &BTreeSet<String>, net: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
-    let pins = connected_pins(db, net);
-    let Some(drvr) = first_driver_term(db, net, &pins) else {
+    // getFirstDriverTerm walks the database's lists: instance terminals, then block terminals.
+    let db_order = connected_pins(db, net)?;
+    let Some(drvr) = first_driver_term(db, net, &db_order).cloned() else {
         return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
     };
-    let decision = estimate_wire_parasitic_drvr(db, timing, clock_nets, net, drvr, &pins, alpha, stt)?;
+    let pins = connected_pins_by_id(db, net)?;
+    let decision = estimate_wire_parasitic_drvr(db, timing, clock_nets, net, &drvr, &pins, alpha, stt)?;
     Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
 
@@ -201,7 +223,7 @@ fn estimate_wire_parasitic_drvr(db: &Db, timing: &Timing<'_>, clock_nets: &BTree
         return Ok(Decision::Special);
     }
     if is_pad_net(db, pins)? {
-        return Ok(Decision::Pad);
+        return Ok(Decision::Pad { pins: pins.to_vec() });
     }
     estimate_wire_parasitic_steiner(db, timing, clock_nets, net, drvr, pins, alpha, stt)
 }
@@ -278,7 +300,7 @@ pub fn trace(nets: &[NetEstimate]) -> String {
             Decision::Power => "power",
             Decision::Ground => "ground",
             Decision::Special => "special",
-            Decision::Pad => "pad",
+            Decision::Pad { .. } => "pad",
             _ => "steiner",
         };
         t.push_str(&format!("VYGE|kind|{}|{kind}\n", n.net));

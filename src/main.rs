@@ -18,7 +18,10 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use vyges_est::liberty::LibertyClocks;
 use vyges_est::placement::{estimate_wire_parasitics, trace, Branch, SttTree, Timing};
+use vyges_est::network::{self, NetCtx};
+use vyges_est::placement::Decision;
 use vyges_est::rc::{Rc, Units};
+use vyges_est::spef::{self, SpefUnits};
 use vyges_opendb::Db;
 
 thread_local! {
@@ -72,9 +75,11 @@ fn run(job: &Value) -> Result<Value, String> {
                 if !args.iter().any(|a| a == "-placement") {
                     return Err("estimate_parasitics without -placement: not modelled".into());
                 }
-                // estimateWireParasitics does nothing unless a signal capacitance resolves.
+                // check_corner_wire_caps (EST-0018): a corner with no signal wire capacitance, and
+                // nothing is estimated at all; estimateWireParasitics then also needs one resolved.
                 let tech = db.tech_get_name();
-                if rc.resolve(&tech, |w| &w.signal_cap).is_empty() {
+                let zero: Vec<usize> = (0..rc.scenes.len()).filter(|&k| { let v = rc.resolved(&tech, k); (v[2] + v[3]) / 2.0 == 0.0 }).collect();
+                if !zero.is_empty() || rc.resolve(&tech, |w| &w.signal_cap).is_empty() {
                     continue;
                 }
                 rc.sort_clk_and_signal_layers();
@@ -83,6 +88,35 @@ fn run(job: &Value) -> Result<Value, String> {
                 let nets = estimate_wire_parasitics(&db, &timing, alpha, &stt)?;
                 estimated += nets.len();
                 trace_text.push_str(&trace(&nets));
+                // -spef_file: one file per corner, `_<corner>` before `.spef` when there are several.
+                if let Some(k) = args.iter().position(|a| a == "-spef_file") {
+                    let path = args.get(k + 1).ok_or("-spef_file needs a path")?;
+                    let u = lib.units.ok_or("SPEF units need a liberty library")?;
+                    let su = SpefUnits { time: u.time, capacitance: u.capacitance, resistance: u.resistance };
+                    for (c, corner) in rc.scenes.iter().enumerate() {
+                        let mut file = path.clone();
+                        if rc.scenes.len() > 1 {
+                            let suffix = format!("_{corner}");
+                            match file.find(".spef").or_else(|| file.find(".SPEF")) {
+                                Some(_) => file.insert_str(file.len() - 5, &suffix),
+                                None => file.push_str(&suffix),
+                            }
+                        }
+                        let mut text = spef::header(&db, su);
+                        for n in &nets {
+                            let g = match &n.decision {
+                                Decision::Tree { tree, non_leaf_clock, .. } => {
+                                    let cx = NetCtx { db: &db, rc: &rc, tech: &tech, corner: c, is_clk: *non_leaf_clock };
+                                    network::make_steiner_parasitic(&cx, &n.net, tree)?
+                                }
+                                Decision::Pad { pins } => network::make_pad_parasitic(&db, pins)?,
+                                _ => continue,
+                            };
+                            text.push_str(&spef::write_net(&n.net, &g, su));
+                        }
+                        std::fs::write(&file, text).map_err(|e| format!("{file}: {e}"))?;
+                    }
+                }
             }
             other => return Err(format!("step {other}: not modelled")),
         }

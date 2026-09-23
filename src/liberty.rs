@@ -572,6 +572,8 @@ pub struct Units {
     pub distance: f32,
     /// `capacitive_load_unit (<scale>, ff|pf)` (default 1 pF).
     pub capacitance: f32,
+    /// `time_unit` (default 1 ns).
+    pub time: f32,
 }
 
 /// `LibertyReader::readUnit`: `<1|10|100><scale char><suffix>`, the scale char one of k m u n p f.
@@ -632,6 +634,7 @@ impl LibertyClocks {
                     resistance: read_unit(lib.attr("pulling_resistance_unit"), "ohm", 1.0),
                     distance: read_unit(lib.attr("distance_unit"), "m", 1e-6),
                     capacitance: read_cap_unit(lib.complex_attr("capacitive_load_unit")),
+                    time: read_unit(lib.attr("time_unit"), "s", 1e-9),
                 });
             }
             for cell in lib.children("cell") {
@@ -812,7 +815,7 @@ mod tests {
         let mut l = LibertyClocks::default();
         l.read(r#"library (a) { pulling_resistance_unit : "1kohm"; }"#).expect("parse");
         l.read(r#"library (b) { pulling_resistance_unit : "1ohm"; }"#).expect("parse");
-        assert_eq!(l.units, Some(Units { resistance: 1e3, distance: 1e-6, capacitance: 1e-12 }), "the first library's units stand");
+        assert_eq!(l.units, Some(Units { resistance: 1e3, distance: 1e-6, capacitance: 1e-12, time: 1e-9 }), "the first library's units stand");
     }
 
     // A simple attribute without its `;` ends at its value: the next statement still parses.
