@@ -8,8 +8,30 @@ authors = ["Vyges <https://vyges.com/contact>"]
 homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/est"
 
+[features]
+# The design database: the clock network and the placement path read it. OFF by default, so the
+# rules stay testable without the C++ build.
+odb = ["dep:vyges-opendb"]
+# The command-line engine: the database, the Steiner-tree builder and JSON jobs.
+cli = ["odb", "dep:vyges-stt", "dep:serde_json"]
+
 [dependencies]
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
+serde_json = { version = "1", optional = true }
 
 [lib]
 name = "vyges_est"
 path = "src/lib.rs"
+
+[[bin]]
+name = "vyges-est"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Local development against the sibling checkouts; a no-op for consumers pulling this by git.
+[patch."https://github.com/vyges-tools/opendb.git"]
+vyges-opendb = { path = "../vyges-tools-opendb" }
+
+[patch."https://github.com/vyges-tools/opendb-lib.git"]
+vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
