@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The register-clock rule against the timer's own answer, port by port, on the libraries the
-//! reference suite reads. Oracle: `grt-regclk-oracle.tcl` (property `is_register_clock`, which is
-//! `LibertyPort::isRegClk`), one `<name>.regclk` per library in `GRT_REGCLK_DIR`, beside the
-//! library path in `<name>.lib` (a one-line file). Skipped when the variable is unset.
+//! reference suite reads. The oracle is the timer's property `is_register_clock` (which is
+//! `LibertyPort::isRegClk`) dumped per port: one `<name>.regclk` per library in `GRT_REGCLK_DIR`,
+//! beside the library path in `<name>.lib` (a one-line file). Skipped when the variable is unset.
 
 use std::collections::BTreeMap;
 use vyges_est::liberty::LibertyClocks;

@@ -95,14 +95,14 @@ pub struct NetCtx<'a> {
 /// `ensureParasiticNode(parasitic, pin)`, with the facts the writer needs.
 fn ensure_pin(db: &Db, g: &mut Parasitic, pin: &PinLoc) -> Res<Node> {
     let key = crate::placement::pin_key(db, pin)?;
-    if !g.pin_nodes.contains_key(&key) {
+    if let std::collections::btree_map::Entry::Vacant(e) = g.pin_nodes.entry(key) {
         let (io_type, master) = if pin.is_port {
             (db.bterm_get_io_type(&pin.name), String::new())
         } else {
             let (inst, term) = pin.name.rsplit_once('/').unwrap_or((&pin.name, ""));
             (db.iterm_get_io_type(inst, term), db.inst_get_master(inst))
         };
-        g.pin_nodes.insert(key, PinNode { name: pin.name.clone(), is_port: pin.is_port, io_type, master, cap: 0.0 });
+        e.insert(PinNode { name: pin.name.clone(), is_port: pin.is_port, io_type, master, cap: 0.0 });
     }
     Ok(Node::Pin(key))
 }

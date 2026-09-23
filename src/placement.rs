@@ -6,11 +6,11 @@
 //! net's first driver) → [`estimate_wire_parasitic_drvr`] (power / ground / special / pad) →
 //! [`estimate_wire_parasitic_steiner`] (`isSkipPin`, then [`make_steiner_tree`]).
 //!
-//! ⬜ This stage decides WHICH nets get a network and builds each one's Steiner tree; the network
-//! itself (branches to resistors and capacitors, pin connection) is not built yet.
+//! This stage decides WHICH nets get a network and builds each one's Steiner tree; the network
+//! itself (branches to resistors and capacitors, pin connection) is [`crate::network`].
 //!
-//! Every decision is also written as the instrumented reference prints it (`est-trace.py`,
-//! `VYGE|…`), so the two can be compared line for line.
+//! Every decision can also be written as one `VYGE|…` line ([`trace`]), a format a reference run
+//! instrumented to print the same fields can be compared against line for line.
 
 #![cfg(feature = "odb")]
 
@@ -272,7 +272,7 @@ fn estimate_wire_parasitic_steiner(db: &Db, timing: &Timing<'_>, clock_nets: &BT
 /// sort does the same), which the corpus has not yet contradicted.
 pub fn make_steiner_tree(drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: SteinerBuilder<'_>) -> (Vec<PinLoc>, Option<usize>, Option<SteinerTree>) {
     let mut pinlocs = pins.to_vec();
-    pinlocs.sort_by(|a, b| (a.x, a.y).cmp(&(b.x, b.y)));
+    pinlocs.sort_by_key(|p| (p.x, p.y));
     let drvr_idx = pinlocs.iter().position(|p| p.name == drvr.name);
     if pinlocs.len() < 2 || pinlocs.iter().any(|p| !p.placed) {
         return (pinlocs, drvr_idx, None);

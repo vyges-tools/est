@@ -1,0 +1,14 @@
+[book]
+title = "vyges-est"
+description = "Parasitic estimation from placement: a Steiner tree per net, its RC network per corner, as SPEF"
+authors = ["Vyges"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/vyges-tools/est"
+
+# The chapter (src/est.md) and the CLI reference (src/reference/vyges-est.md) are written to drop
+# into the Vyges book unchanged, as engines/est.md and engines/reference/vyges-est.md.

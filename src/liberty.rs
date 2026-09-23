@@ -639,9 +639,9 @@ impl LibertyClocks {
             }
             for cell in lib.children("cell") {
                 let name = cell.args.first().cloned().unwrap_or_default();
-                if !self.cells.contains_key(&name) {
-                    let c = read_cell(cell)?;
-                    self.cells.insert(name, c);
+                // The first library to define a cell keeps it.
+                if let std::collections::btree_map::Entry::Vacant(e) = self.cells.entry(name) {
+                    e.insert(read_cell(cell)?);
                 }
             }
         }
