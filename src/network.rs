@@ -270,16 +270,26 @@ fn insert_via_resistances(cx: &NetCtx<'_>, g: &mut Parasitic, p: i32, t: i32, pi
 }
 
 /// `computeAverageCutResistance`: the mean table resistance of the CUT layers between the block's
-/// min and max routing layers (0 with no table). ⬜ A block with no max routing layer falls back to
-/// the frontside stack's middle — refused here.
+/// min and max routing layers (0 with no table).
+///
+/// A block with no max routing layer (`< 0`, nothing set it) takes the MIDDLE of the frontside
+/// stack: `first_level - 1 + (levels - first_level + 1) / 2` (integer), the first frontside level
+/// being the first routing level that is not backside; with no frontside layer, half the levels.
 fn compute_average_cut_resistance(cx: &NetCtx<'_>) -> Res<f64> {
     if cx.rc.layer_res.is_empty() {
         return Ok(0.0);
     }
     let db = cx.db;
-    let (min, max) = (db.block_get_min_routing_layer(), db.block_get_max_routing_layer());
+    let (min, mut max) = (db.block_get_min_routing_layer(), db.block_get_max_routing_layer());
     if max < 0 {
-        return Err("computeAverageCutResistance with no max routing layer: the frontside fallback is not modelled".into());
+        let total = db.tech_get_routing_layer_count();
+        let first_front = db.tech_first_frontside_routing_layer();
+        max = if first_front.is_empty() {
+            total / 2
+        } else {
+            let first_level = db.layer_get_routing_level(&first_front);
+            first_level - 1 + (total - first_level + 1) / 2
+        };
     }
     let by_level = |lvl: i32| db.tech_get_layers().into_iter().find(|l| db.layer_get_routing_level(l) == lvl);
     let (lo, hi) = (by_level(min).ok_or("min routing layer")?, by_level(max).ok_or("max routing layer")?);

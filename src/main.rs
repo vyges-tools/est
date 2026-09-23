@@ -55,11 +55,18 @@ fn run(job: &Value) -> Result<Value, String> {
         match cmd {
             "read_lef" => db.read_lef(args.last().ok_or("read_lef path")?).map_err(|e| e.to_string())?,
             "read_def" => db.read_def(args.last().ok_or("read_def path")?, "default").map_err(|e| e.to_string())?,
+            // A prepared design (the corpus sweep's oracle wrote it just before the estimate).
+            "read_db" => db = Db::open(args.last().ok_or("read_db path")?).map_err(|e| e.to_string())?,
             // -corner reads a corner's library; the cells and units taken are the first read's.
             "read_liberty" => {
                 let path = args.last().ok_or("read_liberty path")?;
                 let text = if path.ends_with(".gz") {
-                    return Err(format!("{path}: a compressed library is not modelled"));
+                    use std::io::Read;
+                    let mut s = String::new();
+                    flate2::read::MultiGzDecoder::new(std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?)
+                        .read_to_string(&mut s)
+                        .map_err(|e| format!("{path}: {e}"))?;
+                    s
                 } else {
                     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
                 };

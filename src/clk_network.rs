@@ -57,7 +57,9 @@ pub fn find_clk_nets(db: &Db, lib: &LibertyClocks, sources: &[String]) -> Res<BT
             }));
         }
         for it in db.net_iterms(&net) {
-            let Some((inst, mterm)) = it.split_once('/') else { continue };
+            // ⛔ The LAST '/': a flattened hierarchical instance name contains '/' itself
+            // (`u_mid1/dff_load1/CK`); the terminal is only what follows the final one.
+            let Some((inst, mterm)) = it.rsplit_once('/') else { continue };
             let master = masters.entry(inst.to_string()).or_insert_with(|| db.inst_master(inst)).clone();
             let dir = db.mterm_get_io_type(&master, mterm);
             pins.push((Pin::ITerm(inst.to_string(), mterm.to_string()), match dir.as_str() {

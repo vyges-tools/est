@@ -89,6 +89,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "cxx"
 version = "1.0.202"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +187,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 
 [[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+ "zlib-rs",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +271,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+ "simd-adler32",
 ]
 
 [[package]]
@@ -366,6 +396,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -413,6 +449,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 name = "vyges-est"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "serde_json",
  "vyges-opendb",
  "vyges-stt",
@@ -437,7 +474,7 @@ name = "vyges-layout"
 version = "0.1.36"
 source = "git+https://github.com/vyges-tools/layout?branch=main#da851018db3739a7c38b3e6d3a0479166a92668b"
 dependencies = [
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "vyges-geom",
 ]
 
@@ -512,6 +549,12 @@ dependencies = [
  "encoding_rs",
  "hashlink",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

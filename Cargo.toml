@@ -13,12 +13,13 @@ repository = "https://github.com/vyges-tools/est"
 # rules stay testable without the C++ build.
 odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 # The command-line engine: the database, the Steiner-tree builder and JSON jobs.
-cli = ["odb", "dep:vyges-stt", "dep:serde_json"]
+cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2"]
 
 [dependencies]
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
 serde_json = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }
 
 [lib]
 name = "vyges_est"
