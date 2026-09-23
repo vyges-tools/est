@@ -16,3 +16,4 @@ pub mod wire;
 pub mod liberty;
 pub mod clk_network;
 pub mod placement;
+pub mod rc;
