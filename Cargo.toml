@@ -1,6 +1,6 @@
 [package]
 name = "vyges-est"
-version = "0.1.0"
+version = "0.1.37"
 edition = "2021"
 description = "Parasitic estimation for placed and globally routed nets: the RC networks a timer reads before detailed routing."
 license = "Apache-2.0"
