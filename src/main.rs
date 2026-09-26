@@ -54,10 +54,19 @@ fn run(job: &Value) -> Result<Value, String> {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
         match cmd {
-            "read_lef" => db.read_lef(args.last().ok_or("read_lef path")?).map_err(|e| e.to_string())?,
-            "read_def" => db.read_def(args.last().ok_or("read_def path")?, "default").map_err(|e| e.to_string())?,
+            "read_lef" => {
+                let path = args.last().ok_or("read_lef path")?;
+                db.read_lef(path).map_err(|e| format!("{path}: {e}"))?
+            }
+            "read_def" => {
+                let path = args.last().ok_or("read_def path")?;
+                db.read_def(path, "default").map_err(|e| format!("{path}: {e}"))?
+            }
             // A prepared design: the database as it stood just before the estimate.
-            "read_db" => db = Db::open(args.last().ok_or("read_db path")?).map_err(|e| e.to_string())?,
+            "read_db" => {
+                let path = args.last().ok_or("read_db path")?;
+                db = Db::open(path).map_err(|e| format!("{path}: {e}"))?
+            }
             // -corner reads a corner's library; the cells and units taken are the first read's.
             "read_liberty" => {
                 let path = args.last().ok_or("read_liberty path")?;
