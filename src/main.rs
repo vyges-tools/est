@@ -255,6 +255,35 @@ fn exit_for(status: &str) -> u8 {
     }
 }
 
+/// The `vyges-events` causal trail: every event goes to STDERR, the report to stdout (or `-o`), so
+/// a caller can parse one without the other. Codes name a situation, not a message:
+///
+/// | code | meaning |
+/// |---|---|
+/// | `EST-DONE` | the run finished; a census of what it did (nets estimated, SPEF files written). `warn` when the status is not the pass word |
+/// | `EST-REFUSED` | a step this engine does not model; the reason names it |
+/// | `EST-ERROR` | usage, unreadable input, or a failed write |
+mod events {
+    use vyges_events::{emit, Event, Severity};
+
+    const TOOL: &str = "vyges-est";
+
+    /// One event for the run's outcome, from its status word and the report's own fields.
+    pub fn outcome(status: &str, pass: &str, reason: Option<&str>, census: &str) {
+        let (code, severity) = match status {
+            "refused" => ("EST-REFUSED", Severity::Error),
+            "error" => ("EST-ERROR", Severity::Error),
+            s if s == pass => ("EST-DONE", Severity::Info),
+            _ => ("EST-DONE", Severity::Warn),
+        };
+        let text = match reason {
+            Some(r) => format!("{status}: {r}"),
+            None => format!("{status}: {census}"),
+        };
+        emit(&Event::new(TOOL, severity, text).with_code(code));
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `-o FILE` — the value is consumed here so it never reaches the positional scan.
@@ -311,6 +340,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // ⛔ Before any database exists: libodb then logs to the events trail (stderr) only, and
+    // stdout carries nothing but the JSON report a caller parses.
+    vyges_opendb::init_events_logging();
     let path = positional[1];
     let report = match std::fs::read_to_string(path)
         .map_err(|e| format!("{path}: {e}"))
@@ -323,6 +355,9 @@ fn main() -> ExitCode {
             Err(e) => json!({ "tool": "vyges-est", "status": if e.contains("not modelled") { "refused" } else { "error" }, "reason": e }),
         },
     };
+    let spefs = report["spef_files"].as_array().map(Vec::len).unwrap_or(0);
+    let census = format!("estimates={} nets={} spef_files={spefs}", report["estimates"], report["nets"]);
+    events::outcome(report["status"].as_str().unwrap_or("error"), "estimated", report["reason"].as_str(), &census);
     let text = format!("{report}\n");
     match &out {
         Some(f) => {
