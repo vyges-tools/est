@@ -87,7 +87,11 @@ fn run(job: &Value) -> Result<Value, String> {
             "create_clock" => clock_sources.extend(args.iter().cloned()),
             "set_propagated_clock" => propagated = true,
             "set_layer_rc" => rc.set_layer_rc(&mut db, units(&lib)?, &args)?,
-            "set_wire_rc" => rc.set_wire_rc(&db, units(&lib)?, &args)?,
+            // The argument checks first: the reference raises them before converting any value.
+            "set_wire_rc" => {
+                rc.check_set_wire_rc(&db, &args)?;
+                rc.set_wire_rc(&db, units(&lib)?, &args)?
+            }
             "estimate_parasitics" => {
                 if !args.iter().any(|a| a == "-placement") {
                     return Err("estimate_parasitics without -placement: not modelled".into());

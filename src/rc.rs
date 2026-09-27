@@ -193,18 +193,37 @@ impl Rc {
         }
     }
 
-    /// `set_wire_rc` — every form the corpus uses; `-redistribution_layer` is refused.
-    pub fn set_wire_rc(&mut self, db: &Db, units: Units, args: &[String]) -> Res<()> {
+    /// `set_wire_rc`'s checks that come BEFORE any value is converted (`parse_key_args`,
+    /// `parse_scene_or_null`, then `parse_wire_rc_techs`: both selectors is EST-28, an unknown
+    /// `-tech` EST-30). The caller runs them before the units are asked for, so a case with no
+    /// liberty library still gets the reference's diagnostic. `-redistribution_layer` is refused
+    /// after them: listing a design's RDL chips is not modelled.
+    pub fn check_set_wire_rc(&self, db: &Db, args: &[String]) -> Res<(BTreeMap<String, String>, Vec<String>, Option<usize>)> {
         let (keys, flags) = parse_key_args(
             args,
             &["-layer", "-layers", "-resistance", "-capacitance", "-corner", "-h_resistance", "-h_capacitance", "-v_resistance", "-v_capacitance", "-tech"],
             &["-clock", "-signal", "-data", "-redistribution_layer"],
         )?;
         let corner = self.scene(&keys)?;
-        if flags.iter().any(|f| f == "-redistribution_layer") {
+        let rdl = flags.iter().any(|f| f == "-redistribution_layer");
+        if rdl && keys.contains_key("-tech") {
+            return Err("[ERROR EST-0028] Use only one of -tech or -redistribution_layer.".into());
+        }
+        if let Some(t) = keys.get("-tech") {
+            if *t != db.tech_get_name() {
+                return Err(format!("[ERROR EST-0030] technology {t} not found."));
+            }
+        }
+        if rdl {
             return Err("set_wire_rc -redistribution_layer: RDL chips are not modelled".into());
         }
-        // parse_wire_rc_techs: -tech names one technology; none means the shared entry.
+        Ok((keys, flags, corner))
+    }
+
+    /// `set_wire_rc` — every form the corpus uses; `-redistribution_layer` is refused.
+    pub fn set_wire_rc(&mut self, db: &Db, units: Units, args: &[String]) -> Res<()> {
+        let (keys, flags, corner) = self.check_set_wire_rc(db, args)?;
+        // -tech names one technology; none means the shared entry.
         // ⚠️ UNWITNESSED: with one technology the per-technology and shared entries resolve alike,
         // so storing -tech values in the shared entry changes no corpus case; the cases that tell
         // them apart (set_wire_rc_selectors, _mixed_tech) script odb directly and are refused.
