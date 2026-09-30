@@ -103,6 +103,10 @@ A refusal is named in `reason`. Nothing is approximated:
   and `set_clock_sense`. They change which pins are clocks without touching the database, so the
   job cannot carry them.
 - RC commands before any liberty library is read. The timer's default units are not modelled.
+  `set_wire_rc` checks its selectors first, as the reference does, so giving both `-tech` and
+  `-redistribution_layer` (EST-0028) or naming a technology the design does not have (EST-0030)
+  is an error even with no library read.
+- `set_wire_rc -redistribution_layer`. Listing a design's RDL chips is not modelled.
 
 ## Where it sits
 
