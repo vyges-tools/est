@@ -185,17 +185,32 @@ fn is_pad_net(db: &Db, pins: &[PinLoc]) -> Res<bool> {
 /// ⛔ Refused rather than guessed: constant pins (`isConstant`: tie cells, case analysis) — a driver
 /// whose cell's output function is a constant is refused.
 pub fn estimate_wire_parasitics(db: &Db, timing: &Timing<'_>, alpha: f32, stt: SteinerBuilder<'_>) -> Res<Vec<NetEstimate>> {
-    let clock_nets: BTreeSet<String> = match timing.liberty {
-        Some(lib) if !timing.clock_sources.is_empty() => {
-            crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?
-        }
-        _ => BTreeSet::new(),
-    };
+    let clock_nets = clock_nets(db, timing)?;
     let mut out = Vec::new();
     for net in db.net_names() {
         out.push(estimate_wire_parasitic(db, timing, &clock_nets, &net, alpha, stt)?);
     }
     Ok(out)
+}
+
+/// The nets `findClkNets` reaches from the clock sources (none without a library or a clock).
+fn clock_nets(db: &Db, timing: &Timing<'_>) -> Res<BTreeSet<String>> {
+    Ok(match timing.liberty {
+        Some(lib) if !timing.clock_sources.is_empty() => crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?,
+        _ => BTreeSet::new(),
+    })
+}
+
+/// `estimateWireParasitic(drvr_pin, net)` for ONE net, from the driver the caller names — what
+/// `ensureWireParasitic` runs on a net marked invalid or a driver with no pi model. `NoDriver`
+/// when that pin is not on the net.
+pub fn estimate_net(db: &Db, timing: &Timing<'_>, net: &str, drvr_pin: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
+    let pins = connected_pins_by_id(db, net)?;
+    let Some(drvr) = pins.iter().find(|p| p.name == drvr_pin).cloned() else {
+        return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
+    };
+    let decision = estimate_wire_parasitic_drvr(db, timing, &clock_nets(db, timing)?, net, &drvr, &pins, alpha, stt)?;
+    Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
 
 /// `estimateWireParasitic(net)`: the net's first driver, if it has one.
