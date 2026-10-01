@@ -286,6 +286,17 @@ pub fn make_steiner_tree(drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: Steine
     (pinlocs, drvr_idx, Some(t))
 }
 
+/// `EstimateParasitics::makeSteinerTree(drvr_pin)` as a caller asks for it directly (the resizer
+/// does, per driver): the flat pins of the driver's net in `connectedPinIterator` order, then
+/// [`make_steiner_tree`] — with NONE of the estimate's own checks (pad net, ideal clock), which
+/// belong to `estimateWireParasitic`, not to the tree. `None` when the net has fewer than two pins,
+/// one is not placed, or the driver is not on it.
+pub fn make_steiner_tree_for_driver(db: &Db, net: &str, drvr_pin: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<Option<SteinerTree>> {
+    let pins = connected_pins_by_id(db, net)?;
+    let Some(drvr) = pins.iter().find(|p| p.name == drvr_pin).cloned() else { return Ok(None) };
+    Ok(make_steiner_tree(&drvr, &pins, alpha, stt).2)
+}
+
 /// The decisions as the instrumented reference prints them (`VYGE|…`).
 pub fn trace(nets: &[NetEstimate]) -> String {
     let pins_line = |net: &str, pins: &[PinLoc], drvr_idx: Option<usize>| {
