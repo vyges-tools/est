@@ -23,8 +23,7 @@
 //! is refused rather than guessed. ⛔ `inferLatchRoles` is not transcribed: a cell it may rewrite
 //! is flagged, and the clock search refuses to pass through it.
 //!
-//! ⚠️ Refused, not modelled: bus and bundle pins, `ff_bank` / `latch_bank` (a sequential per bit),
-//! an unknown `timing_type`.
+//! ⚠️ Refused, not modelled: `latch_bank` (no corpus witness), an unknown `timing_type`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -576,30 +575,18 @@ fn expand_pairs(from: &[String], to: &[String], to_is_bus: bool, one_to_one: boo
 
 fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<CellClock, String> {
     let name = cell.args.first().cloned().unwrap_or_default();
-    for kind in ["bundle", "ff_bank", "latch_bank"] {
-        if cell.children(kind).next().is_some() {
-            return Err(format!("liberty cell {name}: a {kind} group is not modelled"));
-        }
+    // ⚠️ A latch bank has no witness in any corpus; refused rather than modelled on faith.
+    if cell.children("latch_bank").next().is_some() {
+        return Err(format!("liberty cell {name}: a latch_bank group is not modelled"));
     }
     let truthy = |k: &str| cell.attr(k).is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    let mut seqs = Vec::new();
-    let mut seq_of = BTreeMap::new();
-    // makeSequentials: ff groups, then latch groups; a later output mapping overwrites.
-    for (kind, is_register, clk, data) in [("ff", true, "clocked_on", "next_state"), ("latch", false, "enable", "data_in")] {
-        for g in cell.children(kind) {
-            let set = |k: &str| g.attr(k).map(idents).unwrap_or_default();
-            let clock = g.attr(clk).map(parse_expr).transpose().map_err(|e| format!("liberty cell {name}: {e}"))?;
-            seqs.push(Seq { is_register, clock, data: set(data), clear: set("clear"), preset: set("preset") });
-            for out in &g.args {
-                seq_of.insert(out.clone(), seqs.len() - 1);
-            }
-        }
-    }
+    // Every bus-like port by name and its bits in order: buses, bundles (their members), and a
+    // bank's internal outputs — what a function's bus name is sliced against.
+    let mut buses: Vec<(String, Vec<String>)> = Vec::new();
     // makeCellPorts, in the file's order: a pin's names; a bus's bits, then the pin groups inside
     // it naming bits of it. Each port group keeps the ports it applies to and their functions (a
     // bus's sliced per member offset; a pin inside a bus states its own, else keeps the bus's).
     let cell_types = bus_types(cell);
-    let mut buses: Vec<(String, Vec<String>)> = Vec::new();
     // (group, to-ports, whether it is a whole bus)
     let mut port_groups: Vec<(&Group, Vec<String>, bool)> = Vec::new();
     for g in &cell.groups {
@@ -618,7 +605,56 @@ fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<C
                     }
                 }
             }
+            // `makeBundlePort`: the bundle is a port whose members are its bits, in `members`
+            // order; the pin groups inside it name members.
+            "bundle" => {
+                let Some(bundle) = g.args.first() else { continue };
+                let members: Vec<String> = g.complex_attr("members").map(|m| m.to_vec()).unwrap_or_default();
+                buses.push((bundle.clone(), members.clone()));
+                port_groups.push((g, members, true));
+                for ipg in g.children("pin") {
+                    port_groups.push((ipg, ipg.args.clone(), false));
+                }
+            }
             _ => {}
+        }
+    }
+    // makeSequentials, AFTER the ports (`makeCellPorts` runs first): ff, ff_bank, then latch
+    // groups; a later output mapping overwrites. `ff_bank (out, out_inv, size)` (`makeSeqPorts`)
+    // makes each named output an internal BUS `out[size-1:0]`, and `makeSequential` then makes ONE
+    // sequential per bit k: clock, data, clear and preset each `bitSubExpr(k)`, its output member k.
+    let mut seqs = Vec::new();
+    let mut seq_of = BTreeMap::new();
+    for (kind, is_register, clk, data) in
+        [("ff", true, "clocked_on", "next_state"), ("ff_bank", true, "clocked_on", "next_state"), ("latch", false, "enable", "data_in")]
+    {
+        for g in cell.children(kind) {
+            let size = if kind == "ff_bank" {
+                Some(g.args.get(2).and_then(|v| v.trim().parse::<i32>().ok()).ok_or_else(|| format!("liberty cell {name}: ff_bank without a size"))?)
+            } else {
+                None
+            };
+            let outs: Vec<&String> = g.args.iter().take(if size.is_some() { 2 } else { g.args.len() }).filter(|o| !o.is_empty()).collect();
+            let out_bits: Vec<Vec<String>> = outs.iter().map(|o| size.map_or_else(|| vec![(*o).clone()], |n| bus_bits(o, n - 1, 0))).collect();
+            for (o, bits) in outs.iter().zip(&out_bits) {
+                if size.is_some() {
+                    buses.push(((*o).clone(), bits.clone()));
+                }
+            }
+            for k in 0..size.unwrap_or(1) as usize {
+                let bit = |text: &str| -> Result<String, String> {
+                    if size.is_some() { bit_sub_expr(text, k, &buses).map_err(|e| format!("liberty cell {name}: {e}")) } else { Ok(text.to_string()) }
+                };
+                let set = |a: &str| -> Result<BTreeSet<String>, String> { Ok(match g.attr(a) { Some(t) => idents(&bit(t)?), None => BTreeSet::new() }) };
+                let clock = match g.attr(clk) {
+                    Some(t) => Some(parse_expr(&bit(t)?).map_err(|e| format!("liberty cell {name}: {e}"))?),
+                    None => None,
+                };
+                seqs.push(Seq { is_register, clock, data: set(data)?, clear: set("clear")?, preset: set("preset")? });
+                for bits in &out_bits {
+                    seq_of.insert(bits[k].clone(), seqs.len() - 1);
+                }
+            }
         }
     }
     let mut functions: BTreeMap<String, String> = BTreeMap::new();
@@ -808,6 +844,29 @@ mod tests {
         let arcs: Vec<(&str, &str)> = c.arcs.iter().map(|a| (a.from.as_str(), a.to.as_str())).collect();
         assert_eq!(arcs, [("clk", "q[1]"), ("clk", "q[0]"), ("a[1]", "q[1]"), ("a[0]", "q[0]")]);
         assert!(c.constant_outputs.contains("z[1]") && c.constant_outputs.contains("z[0]"));
+    }
+
+    /// Rules (makeBundlePort, makeSequentials over ff_bank, LibertyPort::setFunction): a bundle is
+    /// its members, the pin groups inside it name members; an `ff_bank (IQN, IQNN, 2)` output is an
+    /// internal bus IQN[1:0], one sequential per bit; the bundle's `function : "IQN"` gives member
+    /// k bit k of it (QN0 <- IQN[1]), so each member's clock arc is a known clock-to-Q, not inferred.
+    #[test]
+    fn a_bundle_is_its_members_and_a_bank_is_a_flop_per_bit() {
+        let c = cell(r#"bundle (QN) { members (QN0, QN1); direction : output; function : "IQN";
+              pin (QN0) { timing () { related_pin : "CLK"; timing_type : rising_edge; }
+                timing () { related_pin : "D0"; timing_type : combinational; } }
+              pin (QN1) { timing () { related_pin : "CLK"; timing_type : rising_edge; } } }
+            pin (CLK) { direction : input; clock : true; }
+            bundle (D) { members (D0, D1); direction : input; }
+            pin (D0) { direction : input; timing () { related_pin : "CLK"; timing_type : setup_rising; } }
+            pin (D1) { direction : input; timing () { related_pin : "CLK"; timing_type : setup_rising; } }
+            ff_bank (IQN, IQNN, 2) { clocked_on : "CLK"; next_state : "!D"; }"#);
+        let ports: Vec<&str> = c.ports.keys().map(String::as_str).collect();
+        assert_eq!(ports, ["CLK", "D0", "D1", "QN0", "QN1"]);
+        assert!(c.ports["CLK"] && !c.ports["D0"] && !c.ports["D1"]);
+        let q: Vec<(&str, &str, Role)> = c.arcs.iter().filter(|a| a.to.starts_with("QN")).map(|a| (a.from.as_str(), a.to.as_str(), a.role)).collect();
+        assert_eq!(q, [("CLK", "QN0", Role::RegClkToQ), ("D0", "QN0", Role::Combinational), ("CLK", "QN1", Role::RegClkToQ)]);
+        assert!(!c.latch_roles_may_be_inferred, "QN0's clock arc resolved through IQN[1], not inferred");
     }
 
     #[test]
