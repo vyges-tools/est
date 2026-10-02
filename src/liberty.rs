@@ -189,8 +189,8 @@ fn idents(expr: &str) -> BTreeSet<String> {
 }
 
 /// A parsed liberty function (`FuncExpr`).
-#[derive(Debug, Clone, PartialEq)]
-enum Expr {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Expr {
     Port(String),
     Zero,
     One,
@@ -406,6 +406,55 @@ pub struct CellClock {
     /// has an inferred clock-to-Q arc, and a combinational arc into a pin with a clock-to-Q arc.
     /// Not transcribed — a clock search through such a cell is refused.
     pub latch_roles_may_be_inferred: bool,
+    /// Each port's `direction`, as the library states it.
+    pub directions: BTreeMap<String, String>,
+    /// Each port's `function` (a bus or bundle member's sliced), parsed.
+    pub(crate) functions: BTreeMap<String, Expr>,
+    /// Each port's `three_state` enable, parsed (`LibertyPort::tristateEnable`).
+    pub(crate) tristate: BTreeMap<String, Expr>,
+    /// Ports with `clock_gate_out_pin`, and with `clock_gate_clock_pin` or `clock_gate_enable_pin`.
+    pub clock_gate_out: BTreeSet<String>,
+    pub clock_gate_in: BTreeSet<String>,
+}
+
+/// `Sim::evalExpr`: the expression with the instance's known pin values substituted, ZERO or ONE
+/// only when that alone decides it. The reference composes a BDD with each known value and asks
+/// whether the result is a terminal — the same as asking whether every assignment of the ports
+/// still unknown gives one answer, which is what this does (a cell function has a handful).
+#[cfg_attr(not(feature = "odb"), allow(dead_code))]
+pub(crate) fn eval_constant(e: &Expr, value: &dyn Fn(&str) -> Option<bool>) -> Option<bool> {
+    let mut unknown: Vec<String> = Vec::new();
+    let mut ports = BTreeSet::new();
+    collect_ports(e, &mut ports);
+    for p in ports {
+        if value(&p).is_none() {
+            unknown.push(p);
+        }
+    }
+    fn eval(e: &Expr, value: &dyn Fn(&str) -> Option<bool>, unknown: &[String], bits: u64) -> bool {
+        match e {
+            Expr::Port(p) => match unknown.iter().position(|u| u == p) {
+                Some(k) => bits >> k & 1 == 1,
+                None => value(p).unwrap_or(false),
+            },
+            Expr::Zero => false,
+            Expr::One => true,
+            Expr::Not(l) => !eval(l, value, unknown, bits),
+            Expr::And(l, r) => eval(l, value, unknown, bits) & eval(r, value, unknown, bits),
+            Expr::Or(l, r) => eval(l, value, unknown, bits) | eval(r, value, unknown, bits),
+            Expr::Xor(l, r) => eval(l, value, unknown, bits) ^ eval(r, value, unknown, bits),
+        }
+    }
+    if unknown.len() > 20 {
+        return None; // not a cell function; never decided by enumeration
+    }
+    let first = eval(e, value, &unknown, 0);
+    for bits in 1..(1u64 << unknown.len()) {
+        if eval(e, value, &unknown, bits) != first {
+            return None;
+        }
+    }
+    Some(first)
 }
 
 /// `makeRegLatchArcs`' role (see the module). `Err` when pointer order would decide; the bool is
@@ -710,7 +759,45 @@ fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<C
     // arc into the same pin (unate, cond-matched — not checked here: refusing is the safe side).
     let latch_roles_may_be_inferred =
         has_inferred && arcs.iter().any(|a| a.role == Role::Combinational && arcs.iter().any(|q| q.role == Role::RegClkToQ && q.to == a.to));
-    Ok(CellClock { is_pad: truthy("is_pad") || truthy("pad_cell"), ports, constant_outputs, arcs, latch_roles_may_be_inferred })
+    // What the timer's logic simulation reads of each port (see `crate::sim`).
+    let mut directions = BTreeMap::new();
+    let mut parsed = BTreeMap::new();
+    let mut tristate = BTreeMap::new();
+    let mut clock_gate_out = BTreeSet::new();
+    let mut clock_gate_in = BTreeSet::new();
+    for (g, to_ports, is_bus) in &port_groups {
+        for (offset, p) in to_ports.iter().enumerate() {
+            if let Some(d) = g.attr("direction") {
+                directions.insert(p.clone(), d.to_string());
+            }
+            if let Some(t) = g.attr("three_state") {
+                let sliced = if *is_bus { bit_sub_expr(t, offset, &buses).map_err(|e| format!("liberty cell {name}: {e}"))? } else { t.to_string() };
+                tristate.insert(p.clone(), parse_expr(&sliced).map_err(|e| format!("liberty cell {name}: {e}"))?);
+            }
+            let flag = |k: &str| g.attr(k).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            if flag("clock_gate_out_pin") {
+                clock_gate_out.insert(p.clone());
+            }
+            if flag("clock_gate_clock_pin") || flag("clock_gate_enable_pin") {
+                clock_gate_in.insert(p.clone());
+            }
+        }
+    }
+    for (p, f) in &functions {
+        parsed.insert(p.clone(), parse_expr(f).map_err(|e| format!("liberty cell {name}: {e}"))?);
+    }
+    Ok(CellClock {
+        is_pad: truthy("is_pad") || truthy("pad_cell"),
+        ports,
+        constant_outputs,
+        arcs,
+        latch_roles_may_be_inferred,
+        directions,
+        functions: parsed,
+        tristate,
+        clock_gate_out,
+        clock_gate_in,
+    })
 }
 
 /// The timer's command units, as far as `set_layer_rc` converts through them.
@@ -844,6 +931,21 @@ mod tests {
         let arcs: Vec<(&str, &str)> = c.arcs.iter().map(|a| (a.from.as_str(), a.to.as_str())).collect();
         assert_eq!(arcs, [("clk", "q[1]"), ("clk", "q[0]"), ("a[1]", "q[1]"), ("a[0]", "q[0]")]);
         assert!(c.constant_outputs.contains("z[1]") && c.constant_outputs.contains("z[0]"));
+    }
+
+    /// Rule (Sim::evalExpr): known pin values substituted, the result is ZERO or ONE only when
+    /// that alone decides it — exactly as composing a BDD and asking for a terminal does, which
+    /// is not three-valued logic: `A ^ A` is 0 and `A + !A` is 1 with A unknown.
+    #[test]
+    fn a_function_is_constant_only_when_the_known_pins_decide_it() {
+        let e = |t: &str| parse_expr(t).unwrap();
+        let a0 = |p: &str| (p == "A").then_some(false);
+        assert_eq!(eval_constant(&e("A & B"), &a0), Some(false), "a 0 into an AND");
+        assert_eq!(eval_constant(&e("!(A & B)"), &a0), Some(true), "a NAND's output is then 1");
+        assert_eq!(eval_constant(&e("A | B"), &a0), None, "an OR still follows B");
+        assert_eq!(eval_constant(&e("A ^ A"), &|_| None), Some(false));
+        assert_eq!(eval_constant(&e("A + !A"), &|_| None), Some(true));
+        assert_eq!(eval_constant(&e("IQ"), &|_| None), None, "a sequential output is not looked through");
     }
 
     /// Rules (makeBundlePort, makeSequentials over ff_bank, LibertyPort::setFunction): a bundle is

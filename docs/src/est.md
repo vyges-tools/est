@@ -16,7 +16,7 @@ What the estimate depends on, in the order it is decided:
 
 | stage | decides |
 | --- | --- |
-| **which nets** | power, ground and special nets are skipped. A net straight from a port to a pad gets a 1 mΩ link. An ideal clock (no `set_propagated_clock`) gets nothing. |
+| **which nets** | power, ground and special nets are skipped. A net straight from a port to a pad gets a 1 mΩ link. An ideal clock (no `set_propagated_clock`) gets nothing, nor does a net whose driver the timer's logic simulation holds at a constant (a tie cell, or logic a constant decides). |
 | **the tree** | the net's connected pins, driver first, joined by `vyges-stt` (Prim-Dijkstra at `alpha`) |
 | **the wire RC** | per corner: `set_layer_rc` / `set_wire_rc`, horizontal and vertical weighted, clock RC for clock nets that are not leaves |
 | **the network** | a pi model per branch, a 1 mΩ link for a zero-length one, width scaled by a non-default rule, and a via chain from each pin's layer up to the wire |
@@ -77,11 +77,14 @@ estimated nothing fails it, even when nothing was the right answer.
 Scored against OpenROAD at pin `da9f29f1`, comparing **every SPEF byte for byte** against a fresh
 reference run:
 
-- **8 of 9** of the reference's own `estimate_parasitics -placement` tests. The ninth edits the
-  design through the database's Tcl API, which a job cannot express.
-- **180 of 186** of the other regression cases that call it, across the reference's modules, with
-  **21,289 nets and 0 differing lines**. Each case's design is prepared by the reference and read
-  as a database, so the estimate alone is scored.
+- **9 of 9** of the reference's own `estimate_parasitics -placement` tests.
+- **185 of 186** of the other regression cases that call it, across the reference's modules, with
+  **21,637 nets and 0 differing lines**. Each case's design is prepared by the reference and read
+  as a database, so the estimate alone is scored. The 186th does not run on the reference at this
+  pin.
+- The logic simulation that decides which drivers are constant: on each of those designs, every
+  pin held at 0 or 1 matches the reference reading the same database, value for value (4,349 on
+  the largest).
 
 ⚠️ **A number here means nothing without the build.** The reference's own answer moves between
 OpenROAD commits, so the pin is part of the claim. `--describe` publishes the pin this binary was
@@ -97,8 +100,7 @@ on real designs.
 A refusal is named in `reason`. Nothing is approximated:
 
 - `estimate_parasitics -global_routing`. Only `-placement` is modelled.
-- Liberty `bus`, `bundle`, `ff_bank` and `latch_bank` groups.
-- A net driven by a tie cell's constant output.
+- Liberty `latch_bank` groups.
 - `set_case_analysis`, `set_logic_*`, `set_disable_timing`, `create_generated_clock`, `set_sense`
   and `set_clock_sense`. They change which pins are clocks without touching the database, so the
   job cannot carry them.

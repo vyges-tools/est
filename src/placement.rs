@@ -180,25 +180,40 @@ fn is_pad_net(db: &Db, pins: &[PinLoc]) -> Res<bool> {
     Ok((p1.is_port && is_pad_pin(p2)?) || (p2.is_port && is_pad_pin(p1)?))
 }
 
-/// `estimateWireParasitics`: every `dbNet` in block order.
-///
-/// ⛔ Refused rather than guessed: constant pins (`isConstant`: tie cells, case analysis) — a driver
-/// whose cell's output function is a constant is refused.
+/// `estimateWireParasitics`: every `dbNet` in block order. A constant driver (`isConstant`, the
+/// logic simulation in `crate::sim`) gets no network; SDC constants are refused before estimation.
 pub fn estimate_wire_parasitics(db: &Db, timing: &Timing<'_>, alpha: f32, stt: SteinerBuilder<'_>) -> Res<Vec<NetEstimate>> {
-    let clock_nets = clock_nets(db, timing)?;
+    let skips = skips(db, timing)?;
     let mut out = Vec::new();
     for net in db.net_names() {
-        out.push(estimate_wire_parasitic(db, timing, &clock_nets, &net, alpha, stt)?);
+        out.push(estimate_wire_parasitic(db, timing, &skips, &net, alpha, stt)?);
     }
     Ok(out)
 }
 
-/// The nets `findClkNets` reaches from the clock sources (none without a library or a clock).
-fn clock_nets(db: &Db, timing: &Timing<'_>) -> Res<BTreeSet<String>> {
-    Ok(match timing.liberty {
+/// What `isSkipPin` reads: the nets `findClkNets` reaches from the clock sources (none without a
+/// library or a clock), and the pins the logic simulation holds constant (`Sim::isConstant`).
+struct Skips {
+    clock_nets: BTreeSet<String>,
+    constants: BTreeSet<String>,
+}
+
+fn skips(db: &Db, timing: &Timing<'_>) -> Res<Skips> {
+    let clock_nets = match timing.liberty {
         Some(lib) if !timing.clock_sources.is_empty() => crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?,
         _ => BTreeSet::new(),
-    })
+    };
+    let empty = crate::liberty::LibertyClocks::default();
+    let values = crate::sim::constant_pins(db, timing.liberty.unwrap_or(&empty)).map_err(|e| e.to_string())?;
+    // STAGE DUMP — every constant pin and its value, to diff against the reference's
+    // `sta::pin_sim_logic_value` over the same design.
+    if let Some(path) = std::env::var_os("EST_SIM_DUMP") {
+        let mut lines: Vec<String> = values.iter().map(|(p, v)| format!("{} {}", p.path_name(), u8::from(*v))).collect();
+        lines.sort();
+        std::fs::write(path, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    }
+    let constants = values.keys().map(|p| p.path_name()).collect();
+    Ok(Skips { clock_nets, constants })
 }
 
 /// `estimateWireParasitic(drvr_pin, net)` for ONE net, from the driver the caller names — what
@@ -209,26 +224,26 @@ pub fn estimate_net(db: &Db, timing: &Timing<'_>, net: &str, drvr_pin: &str, alp
     let Some(drvr) = pins.iter().find(|p| p.name == drvr_pin).cloned() else {
         return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
     };
-    let decision = estimate_wire_parasitic_drvr(db, timing, &clock_nets(db, timing)?, net, &drvr, &pins, alpha, stt)?;
+    let decision = estimate_wire_parasitic_drvr(db, timing, &skips(db, timing)?, net, &drvr, &pins, alpha, stt)?;
     Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
 
 /// `estimateWireParasitic(net)`: the net's first driver, if it has one.
-fn estimate_wire_parasitic(db: &Db, timing: &Timing<'_>, clock_nets: &BTreeSet<String>, net: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
+fn estimate_wire_parasitic(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
     // getFirstDriverTerm walks the database's lists: instance terminals, then block terminals.
     let db_order = connected_pins(db, net)?;
     let Some(drvr) = first_driver_term(db, net, &db_order).cloned() else {
         return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
     };
     let pins = connected_pins_by_id(db, net)?;
-    let decision = estimate_wire_parasitic_drvr(db, timing, clock_nets, net, &drvr, &pins, alpha, stt)?;
+    let decision = estimate_wire_parasitic_drvr(db, timing, skips, net, &drvr, &pins, alpha, stt)?;
     Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
 
 /// `estimateWireParasitic(drvr, net)`: power, ground and special nets get nothing; a pad net its
 /// own model; every other net the Steiner estimate.
 #[allow(clippy::too_many_arguments)]
-fn estimate_wire_parasitic_drvr(db: &Db, timing: &Timing<'_>, clock_nets: &BTreeSet<String>, net: &str, drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: SteinerBuilder<'_>) -> Res<Decision> {
+fn estimate_wire_parasitic_drvr(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: SteinerBuilder<'_>) -> Res<Decision> {
     match db.net_sigtype(net).as_str() {
         "POWER" => return Ok(Decision::Power),
         "GROUND" => return Ok(Decision::Ground),
@@ -240,24 +255,22 @@ fn estimate_wire_parasitic_drvr(db: &Db, timing: &Timing<'_>, clock_nets: &BTree
     if is_pad_net(db, pins)? {
         return Ok(Decision::Pad { pins: pins.to_vec() });
     }
-    estimate_wire_parasitic_steiner(db, timing, clock_nets, net, drvr, pins, alpha, stt)
+    estimate_wire_parasitic_steiner(db, timing, skips, net, drvr, pins, alpha, stt)
 }
 
 /// `estimateWireParasiticSteiner`, up to the tree: `isSkipPin(driver)`, then `makeSteinerTree`.
 ///
 /// `isSkipPin`: a pin that is a clock (in the clock network — its net is one `findClkNets`
-/// reaches) and ideal (no `set_propagated_clock`) gets no network.
+/// reaches) and ideal (no `set_propagated_clock`) gets no network; nor does a pin the logic
+/// simulation holds constant (a tie cell's output, or logic a constant decides — see `crate::sim`).
+/// No SDC constant or disabled pin reaches here: those are refused before estimation.
 #[allow(clippy::too_many_arguments)]
-fn estimate_wire_parasitic_steiner(db: &Db, timing: &Timing<'_>, clock_nets: &BTreeSet<String>, net: &str, drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: SteinerBuilder<'_>) -> Res<Decision> {
-    if clock_nets.contains(net) && !timing.propagated {
+fn estimate_wire_parasitic_steiner(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: SteinerBuilder<'_>) -> Res<Decision> {
+    if skips.clock_nets.contains(net) && !timing.propagated {
         return Ok(Decision::Skip);
     }
-    // isConstant: a tie cell's output is a constant pin — skipped by the reference, not modelled.
-    if !drvr.is_port {
-        let (inst, term) = drvr.name.rsplit_once('/').unwrap_or((&drvr.name, ""));
-        if timing.liberty.and_then(|l| l.cells.get(&db.inst_get_master(inst))).is_some_and(|c| c.constant_outputs.contains(term)) {
-            return Err(format!("net {net}: driven by a constant (tie) output — isConstant is not modelled"));
-        }
+    if skips.constants.contains(&drvr.name) {
+        return Ok(Decision::Skip);
     }
     let (pinlocs, drvr_idx, tree) = make_steiner_tree(drvr, pins, alpha, stt);
     Ok(match tree {
