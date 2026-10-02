@@ -501,9 +501,82 @@ fn arc_role(timing_type: &str, function: Option<&Expr>, from: &str, seq_of: &BTr
     })
 }
 
-fn read_cell(cell: &Group) -> Result<CellClock, String> {
+/// `readBusTypes`: the `type` groups under a library or a cell, name -> (bit_from, bit_to).
+fn bus_types(g: &Group) -> BTreeMap<String, (i32, i32)> {
+    let mut out = BTreeMap::new();
+    for t in g.children("type") {
+        let int = |k: &str| t.attr(k).and_then(|v| v.trim().parse::<i32>().ok());
+        if let (Some(name), Some(from), Some(to)) = (t.args.first(), int("bit_from"), int("bit_to")) {
+            out.insert(name.clone(), (from, to));
+        }
+    }
+    out
+}
+
+/// `makeBusPortBits`: `name[i]` for i from `from` to `to`, counting up or down.
+fn bus_bits(name: &str, from: i32, to: i32) -> Vec<String> {
+    let idx: Vec<i32> = if from < to { (from..=to).collect() } else { (to..=from).rev().collect() };
+    idx.into_iter().map(|i| format!("{name}[{i}]")).collect()
+}
+
+/// `FuncExpr::bitSubExpr(k)` on an expression's text: each bus named becomes its member `k`.
+fn bit_sub_expr(expr: &str, k: usize, buses: &[(String, Vec<String>)]) -> Result<String, String> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphanumeric() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            match buses.iter().find(|(b, _)| *b == word) {
+                Some((_, members)) if chars.get(i) != Some(&'[') => out.push_str(members.get(k).ok_or_else(|| format!("{word} has no member {k}"))?),
+                _ => out.push_str(&word),
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// `PortNameBitIterator`: a bus name -> its bits; `name[a:b]` -> bits a to b; else the name.
+fn port_bits(name: &str, buses: &[(String, Vec<String>)]) -> Vec<String> {
+    if let Some((_, m)) = buses.iter().find(|(b, _)| b == name) {
+        return m.clone();
+    }
+    if let Some((base, rest)) = name.split_once('[') {
+        if let Some((a, b)) = rest.strip_suffix(']').and_then(|r| r.split_once(':')) {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                return bus_bits(base, a, b);
+            }
+        }
+    }
+    vec![name.to_string()]
+}
+
+/// `LibertyReader::makeTimingArcs(cell, from_name, to_port, one_to_one)`: the (from, to) bit pairs
+/// in the reader's order — see vyges-sta's liberty reader, which transcribes the same rule.
+fn expand_pairs(from: &[String], to: &[String], to_is_bus: bool, one_to_one: bool) -> Vec<(String, String)> {
+    if from.len() > 1 && to_is_bus {
+        if one_to_one {
+            let n = from.len().min(to.len());
+            return from[from.len() - n..].iter().cloned().zip(to[to.len() - n..].iter().cloned()).collect();
+        }
+        return from.iter().flat_map(|f| to.iter().map(move |t| (f.clone(), t.clone()))).collect();
+    }
+    if to_is_bus {
+        return from.first().map(|f| to.iter().map(|t| (f.clone(), t.clone())).collect()).unwrap_or_default();
+    }
+    from.iter().map(|f| (f.clone(), to[0].clone())).collect()
+}
+
+fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<CellClock, String> {
     let name = cell.args.first().cloned().unwrap_or_default();
-    for kind in ["bus", "bundle", "ff_bank", "latch_bank"] {
+    for kind in ["bundle", "ff_bank", "latch_bank"] {
         if cell.children(kind).next().is_some() {
             return Err(format!("liberty cell {name}: a {kind} group is not modelled"));
         }
@@ -522,33 +595,77 @@ fn read_cell(cell: &Group) -> Result<CellClock, String> {
             }
         }
     }
+    // makeCellPorts, in the file's order: a pin's names; a bus's bits, then the pin groups inside
+    // it naming bits of it. Each port group keeps the ports it applies to and their functions (a
+    // bus's sliced per member offset; a pin inside a bus states its own, else keeps the bus's).
+    let cell_types = bus_types(cell);
+    let mut buses: Vec<(String, Vec<String>)> = Vec::new();
+    // (group, to-ports, whether it is a whole bus)
+    let mut port_groups: Vec<(&Group, Vec<String>, bool)> = Vec::new();
+    for g in &cell.groups {
+        match g.kind.as_str() {
+            "pin" => port_groups.push((g, g.args.clone(), false)),
+            "bus" => {
+                let ty = g.attr("bus_type").ok_or_else(|| format!("liberty cell {name}: a bus without bus_type is not modelled"))?;
+                let &(from, to) = cell_types.get(ty).or_else(|| lib_types.get(ty)).ok_or_else(|| format!("liberty cell {name}: bus_type {ty} not found"))?;
+                for bus in &g.args {
+                    let bits = bus_bits(bus, from, to);
+                    buses.push((bus.clone(), bits.clone()));
+                    port_groups.push((g, bits, true));
+                    for ipg in g.children("pin") {
+                        let names: Vec<String> = ipg.args.iter().flat_map(|n| port_bits(n, &buses)).collect();
+                        port_groups.push((ipg, names, false));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut functions: BTreeMap<String, String> = BTreeMap::new();
+    for (g, to_ports, is_bus) in &port_groups {
+        if let Some(f) = g.attr("function") {
+            for (offset, p) in to_ports.iter().enumerate() {
+                let sliced = if *is_bus { bit_sub_expr(f, offset, &buses).map_err(|e| format!("liberty cell {name}: {e}"))? } else { f.to_string() };
+                functions.insert(p.clone(), sliced);
+            }
+        }
+    }
     let mut ports = BTreeMap::new();
     let mut constant_outputs = BTreeSet::new();
-    for pin in cell.children("pin") {
-        for p in &pin.args {
+    for (_, to_ports, _) in &port_groups {
+        for p in to_ports {
             ports.entry(p.clone()).or_insert(false);
-            if let Some(f) = pin.attr("function") {
-                if matches!(f.trim().trim_matches('"').trim(), "0" | "1") {
-                    constant_outputs.insert(p.clone());
-                }
+            if functions.get(p).is_some_and(|f| matches!(f.trim().trim_matches('"').trim(), "0" | "1")) {
+                constant_outputs.insert(p.clone());
             }
         }
     }
     let mut arcs = Vec::new();
     let mut has_inferred = false;
-    for pin in cell.children("pin") {
-        let function = pin.attr("function").map(parse_expr).transpose().map_err(|e| format!("liberty cell {name}: {e}"))?;
-        for timing in pin.children("timing") {
+    for (g, to_ports, is_bus) in &port_groups {
+        for timing in g.children("timing") {
             let tt = timing.attr("timing_type").unwrap_or("combinational");
-            for from in timing.attr("related_pin").unwrap_or("").split_whitespace() {
-                let (role, inferred) = arc_role(tt, function.as_ref(), from, &seq_of, &seqs).map_err(|e| format!("liberty cell {name}: {e}"))?;
-                // makeTimingArcPortMaps: the FROM port of clock-to-Q or enable-to-Q.
-                if matches!(role, Role::RegClkToQ | Role::LatchEnToQ) {
-                    ports.insert(from.to_string(), true);
+            let related = |k: &str| timing.attr(k).unwrap_or("").split_whitespace().map(String::from).collect::<Vec<_>>();
+            // Per related name, the bit pairs it expands to (related_pin one to one, related_bus_pins
+            // every pair); a plain pin group is the pin itself.
+            let to_sets: Vec<Vec<String>> = if *is_bus { vec![to_ports.clone()] } else { to_ports.iter().map(|t| vec![t.clone()]).collect() };
+            for to_bits in &to_sets {
+                let mut pairs = Vec::new();
+                for r in related("related_pin") {
+                    pairs.extend(expand_pairs(&port_bits(&r, &buses), to_bits, *is_bus, true));
                 }
-                has_inferred |= inferred;
-                for to in &pin.args {
-                    arcs.push(CellArc { from: from.to_string(), to: to.clone(), role });
+                for r in related("related_bus_pins") {
+                    pairs.extend(expand_pairs(&port_bits(&r, &buses), to_bits, *is_bus, false));
+                }
+                for (from, to) in pairs {
+                    let function = functions.get(&to).map(|f| parse_expr(f)).transpose().map_err(|e| format!("liberty cell {name}: {e}"))?;
+                    let (role, inferred) = arc_role(tt, function.as_ref(), &from, &seq_of, &seqs).map_err(|e| format!("liberty cell {name}: {e}"))?;
+                    // makeTimingArcPortMaps: the FROM port of clock-to-Q or enable-to-Q.
+                    if matches!(role, Role::RegClkToQ | Role::LatchEnToQ) {
+                        ports.insert(from.clone(), true);
+                    }
+                    has_inferred |= inferred;
+                    arcs.push(CellArc { from, to, role });
                 }
             }
         }
@@ -637,11 +754,12 @@ impl LibertyClocks {
                     time: read_unit(lib.attr("time_unit"), "s", 1e-9),
                 });
             }
+            let lib_types = bus_types(lib);
             for cell in lib.children("cell") {
                 let name = cell.args.first().cloned().unwrap_or_default();
                 // The first library to define a cell keeps it.
                 if let std::collections::btree_map::Entry::Vacant(e) = self.cells.entry(name) {
-                    e.insert(read_cell(cell)?);
+                    e.insert(read_cell(cell, &lib_types)?);
                 }
             }
         }
@@ -668,6 +786,30 @@ mod tests {
     }
 
     // makeRegLatchArcs: the edge arc's FROM port is named by the ff's clocked_on → clock-to-Q.
+    /// Rules (makeBusPort, makeTimingArcs): a bus is its bits, bit_from to bit_to; a related_pin bus
+    /// to a bus is one to one; a rising_edge arc from a clock pin into a bus output makes the clock
+    /// a register clock (every bit is a to-port); a bus function of constants marks every bit.
+    #[test]
+    fn a_bus_is_its_bits_and_its_arcs_are_per_bit() {
+        let mut l = LibertyClocks::default();
+        l.read(r#"library (t) {
+          type (b2) { base_type : array; data_type : bit; bit_width : 2; bit_from : 1; bit_to : 0; }
+          cell (m) {
+            pin (clk) { direction : input; clock : true; }
+            bus (a) { bus_type : b2; direction : input; }
+            bus (q) { bus_type : b2; direction : output;
+              timing () { related_pin : "clk"; timing_type : rising_edge; }
+              timing () { related_pin : "a"; timing_type : combinational; } }
+            bus (z) { bus_type : b2; direction : output; function : "0"; } } }"#).expect("parse");
+        let c = &l.cells["m"];
+        let ports: Vec<&str> = c.ports.keys().map(String::as_str).collect();
+        assert_eq!(ports, ["a[0]", "a[1]", "clk", "q[0]", "q[1]", "z[0]", "z[1]"]);
+        assert!(c.ports["clk"], "a clock-to-Q arc into the bus makes clk a register clock");
+        let arcs: Vec<(&str, &str)> = c.arcs.iter().map(|a| (a.from.as_str(), a.to.as_str())).collect();
+        assert_eq!(arcs, [("clk", "q[1]"), ("clk", "q[0]"), ("a[1]", "q[1]"), ("a[0]", "q[0]")]);
+        assert!(c.constant_outputs.contains("z[1]") && c.constant_outputs.contains("z[0]"));
+    }
+
     #[test]
     fn a_flop_clock_is_a_register_clock() {
         let c = cell(r#"ff ("IQ","IQ_N") { clocked_on : "CLK"; next_state : "D"; clear : "!RESET_B"; }
@@ -852,10 +994,12 @@ mod tests {
         assert!(e.unwrap_err().contains("pointer order"));
     }
 
+    /// A bus whose bus_type is declared nowhere: the reader warns and makes no port; refused here
+    /// rather than read as a cell missing a port.
     #[test]
-    fn a_bus_is_refused() {
+    fn an_undeclared_bus_type_is_refused() {
         let mut l = LibertyClocks::default();
-        assert!(l.read("library (t) { cell (c) { bus (D) { bus_type : b; } } }").unwrap_err().contains("bus"));
+        assert!(l.read("library (t) { cell (c) { bus (D) { bus_type : b; } } }").unwrap_err().contains("bus_type b not found"));
     }
 
     // isClkTerm: a terminal with no liberty port is never a clock terminal; a pad cell's is.
