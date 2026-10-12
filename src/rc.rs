@@ -23,6 +23,8 @@ use std::collections::BTreeMap;
 use vyges_opendb::Db;
 
 type Res<T> = Result<T, String>;
+/// `set_wire_rc`'s parsed keys, its flags, and the scene it names (if any).
+type WireRcArgs = (BTreeMap<String, String>, Vec<String>, Option<usize>);
 
 /// The timer's user units (`sta::Units`), as `float` scales.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -198,7 +200,7 @@ impl Rc {
     /// `-tech` EST-30). The caller runs them before the units are asked for, so a case with no
     /// liberty library still gets the reference's diagnostic. `-redistribution_layer` is refused
     /// after them: listing a design's RDL chips is not modelled.
-    pub fn check_set_wire_rc(&self, db: &Db, args: &[String]) -> Res<(BTreeMap<String, String>, Vec<String>, Option<usize>)> {
+    pub fn check_set_wire_rc(&self, db: &Db, args: &[String]) -> Res<WireRcArgs> {
         let (keys, flags) = parse_key_args(
             args,
             &["-layer", "-layers", "-resistance", "-capacitance", "-corner", "-h_resistance", "-h_capacitance", "-v_resistance", "-v_capacitance", "-tech"],

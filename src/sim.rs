@@ -201,9 +201,9 @@ pub fn constant_pins(db: &Db, lib: &LibertyClocks) -> Res<BTreeMap<Pin, bool>> {
     // `ensureConstantFuncPins` walks EVERY leaf instance — a tie cell whose output reaches no net
     // still holds its constant.
     for inst in db.inst_names() {
-        if !sim.master.contains_key(&inst) {
-            let m = db.inst_master(&inst);
-            sim.master.insert(inst, m);
+        if let std::collections::btree_map::Entry::Vacant(e) = sim.master.entry(inst) {
+            let m = db.inst_master(e.key());
+            e.insert(m);
         }
     }
     let mut by_master: BTreeMap<String, Vec<String>> = BTreeMap::new();
