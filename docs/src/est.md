@@ -74,8 +74,12 @@ estimated nothing fails it, even when nothing was the right answer.
 
 ## Correlation
 
-Scored against OpenROAD at pin `da9f29f1`, comparing **every SPEF byte for byte** against a fresh
-reference run:
+Scored against OpenROAD at pin `27288f5c` (2026-10-12), comparing **every SPEF byte for byte** against a
+fresh reference run: **9 of 9** of the reference's own `estimate_parasitics -placement` tests, and
+**191 of 192** of the other regression cases that call it, **22,484 nets** exact; the one case not
+scored fails while the reference prepares it.
+
+Earlier, at pin `da9f29f1`:
 
 - **9 of 9** of the reference's own `estimate_parasitics -placement` tests.
 - **185 of 186** of the other regression cases that call it, across the reference's modules, with
