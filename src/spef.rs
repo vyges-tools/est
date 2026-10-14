@@ -79,17 +79,23 @@ pub fn write_net(net: &str, g: &Parasitic, units: SpefUnits) -> String {
             t.push_str(&format!("*I {} {} *D {}\n", escape_special(&fix_pin_delimiter(&p.name)), io_text(&p.io_type), p.master));
         }
     }
+    // `*CAP` walks `nodes()` — the pin nodes (by key), then the Steiner nodes (by id) — and writes
+    // every node with a ground capacitance, PIN NODES INCLUDED: global-routing parasitics put the
+    // pin-to-grid segment's cap on the pin node (upstream #11482). A placement estimate never
+    // does, so its files are unchanged.
     let mut count = 1;
     let mut label = false;
-    for (id, cap) in &g.sub_nodes {
-        if *cap == 0.0 {
+    let pins = g.pin_nodes.values().map(|p| (escape_special(&if p.is_port { p.name.clone() } else { fix_pin_delimiter(&p.name) }), p.cap));
+    let subs = g.sub_nodes.iter().map(|(id, cap)| (escape_special(&format!("{net}:{id}")), *cap));
+    for (name, cap) in pins.chain(subs) {
+        if cap == 0.0 {
             continue;
         }
         if !label {
             label = true;
             t.push_str("*CAP\n");
         }
-        t.push_str(&format!("{count} {}:{id} {}\n", escape_special(net), g6(*cap / units.capacitance)));
+        t.push_str(&format!("{count} {name} {}\n", g6(cap / units.capacitance)));
         count += 1;
     }
     let name = |n: &Node| match n {
@@ -107,4 +113,30 @@ pub fn write_net(net: &str, g: &Parasitic, units: SpefUnits) -> String {
     }
     t.push_str("*END\n\n");
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::PinNode;
+
+    /// Rule (`SpefWriter::writeNet`, upstream #11482): `*CAP` walks `nodes()` — pin nodes by key,
+    /// then Steiner nodes by id — and writes each one with a non-zero ground cap, pins included;
+    /// one count runs through both.
+    #[test]
+    fn pin_node_caps_come_first_and_share_the_count() {
+        let units = SpefUnits { time: 1e-9, capacitance: 1e-15, resistance: 1e3 };
+        let pin = |name: &str, is_port: bool, cap: f32| PinNode { name: name.into(), is_port, io_type: "INPUT".into(), master: if is_port { String::new() } else { "BUF_X4".into() }, cap };
+        let mut g = Parasitic::default();
+        g.pin_nodes.insert(1, pin("clk", true, 0.5e-15));
+        g.pin_nodes.insert(4, pin("u1/A", false, 0.0));
+        g.pin_nodes.insert(6, pin("u2/A", false, 0.25e-15));
+        g.sub_nodes.insert(1, 2.0e-15);
+        g.sub_nodes.insert(2, 0.0);
+        g.resistors.push((Node::Pin(1), Node::Sub(1), 10.0));
+        let t = write_net("clk", &g, units);
+        let cap: Vec<&str> = t.lines().skip_while(|l| *l != "*CAP").skip(1).take_while(|l| !l.starts_with('*')).collect();
+        assert_eq!(cap, ["1 clk 0.5", "2 u2:A 0.25", "3 clk:1 2"]);
+        assert!(t.starts_with("*D_NET clk 2.75\n"), "{t}");
+    }
 }
