@@ -193,12 +193,29 @@ pub fn estimate_wire_parasitics(db: &Db, timing: &Timing<'_>, alpha: f32, stt: S
 
 /// What `isSkipPin` reads: the nets `findClkNets` reaches from the clock sources (none without a
 /// library or a clock), and the pins the logic simulation holds constant (`Sim::isConstant`).
-struct Skips {
+///
+/// Both are whole-design walks. A caller estimating one net at a time across many edits (a repair
+/// loop) can hold them with [`skips`] and [`estimate_net_with_skips`], and must compute them again
+/// after any edit that could change them: one that touches a clock net or a net with a constant pin.
+#[derive(Debug, Clone)]
+pub struct Skips {
     clock_nets: BTreeSet<String>,
     constants: BTreeSet<String>,
 }
 
-fn skips(db: &Db, timing: &Timing<'_>) -> Res<Skips> {
+impl Skips {
+    /// The nets on the clock network.
+    pub fn clock_nets(&self) -> &BTreeSet<String> {
+        &self.clock_nets
+    }
+    /// The pins (`inst/pin` or a port) the logic simulation holds constant.
+    pub fn constant_pins(&self) -> &BTreeSet<String> {
+        &self.constants
+    }
+}
+
+/// The clock nets and the constant pins of the design as it is now (see [`Skips`]).
+pub fn skips(db: &Db, timing: &Timing<'_>) -> Res<Skips> {
     let clock_nets = match timing.liberty {
         Some(lib) if !timing.clock_sources.is_empty() => crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?,
         _ => BTreeSet::new(),
@@ -220,11 +237,17 @@ fn skips(db: &Db, timing: &Timing<'_>) -> Res<Skips> {
 /// `ensureWireParasitic` runs on a net marked invalid or a driver with no pi model. `NoDriver`
 /// when that pin is not on the net.
 pub fn estimate_net(db: &Db, timing: &Timing<'_>, net: &str, drvr_pin: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
+    estimate_net_with_skips(db, timing, &skips(db, timing)?, net, drvr_pin, alpha, stt)
+}
+
+/// [`estimate_net`] with the clock nets and constant pins the caller holds; they must describe the
+/// design as it is now.
+pub fn estimate_net_with_skips(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, drvr_pin: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
     let pins = connected_pins_by_id(db, net)?;
     let Some(drvr) = pins.iter().find(|p| p.name == drvr_pin).cloned() else {
         return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
     };
-    let decision = estimate_wire_parasitic_drvr(db, timing, &skips(db, timing)?, net, &drvr, &pins, alpha, stt)?;
+    let decision = estimate_wire_parasitic_drvr(db, timing, skips, net, &drvr, &pins, alpha, stt)?;
     Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
 
