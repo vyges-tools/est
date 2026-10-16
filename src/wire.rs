@@ -250,7 +250,7 @@ fn make_route_parasitics(net: &NetParasitics<'_>, rc: &LayerRC, g: &mut Network,
         } else if seg.init_layer == seg.final_layer {
             (res, cap) = rc.layer_rc(wire_length_dbu, seg.init_layer, net.ndr_width.and_then(|m| m.get(&seg.init_layer).copied()));
         } else {
-            g.warnings.push(format!("EST-0025: non wire or via route found on net {}", net.name));
+            g.warnings.push(format!("EST-0025: Non wire or via route found on net {}.", net.name));
         }
         g.incr_cap(&n1, (f64::from(cap) / 2.0) as f32);
         g.make_resistor(&n1, &n2, res);
@@ -282,7 +282,7 @@ fn make_partial_parasitics_to_pin(net: &NetParasitics<'_>, pin: &PinGridLocation
         via_res = rc.cut_layer_res_above(layer - 1);
     }
     let Some(grid_node) = grid_node else {
-        g.warnings.push(format!("EST-0350: missing route to pin {}", pin.name));
+        g.warnings.push(format!("EST-0350: Missing route to pin {}.", pin.name));
         return;
     };
     let wire_length_dbu = (pin.pt.0 - pin.grid_pt.0).abs() + (pin.pt.1 - pin.grid_pt.1).abs();
