@@ -447,7 +447,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vyges-est"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "flate2",
  "serde_json",
@@ -458,8 +458,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-events"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/events?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/events?branch=main#e56d57383fbc4a21c3e4f35e13abb8a750956bb7"
 dependencies = [
  "serde",
  "serde_json",
@@ -467,13 +467,13 @@ dependencies = [
 
 [[package]]
 name = "vyges-geom"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/geom?branch=main#3127d9b8392325c766d2e79dd0f632dd37199d68"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/geom?branch=main#79bc9c6ef94df703a56d07ab4219fa5d79d54bcb"
 
 [[package]]
 name = "vyges-layout"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/layout?branch=main#da309b2e8c286a3d5db41025fbb1b26df3c1e5e7"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/layout?branch=main#ca6ff39f09ce193e70b859c15c89aa72f81bd9ff"
 dependencies = [
  "miniz_oxide 0.8.9",
  "vyges-geom",
@@ -481,12 +481,12 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/loom.git?branch=main#5b3c6a8f328b6230579addb1760a136ad297384f"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/loom.git?branch=main#3be9660130387b240401adec7bf08ac22dd824c3"
 
 [[package]]
 name = "vyges-opendb"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "cxx",
  "serde",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-opendb-lib"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "cmake",
  "cxx",
@@ -509,8 +509,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-stt"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/stt.git?branch=main#4759cdea394dfeed115663457f3f3077e58bf445"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/stt.git?branch=main#6c1e6fafca8de3be04ca82d4866cec12e9e291d3"
 dependencies = [
  "serde_json",
  "vyges-events",
