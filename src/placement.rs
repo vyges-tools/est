@@ -108,32 +108,42 @@ pub fn pin_key(db: &Db, pin: &PinLoc) -> Res<u64> {
     }
 }
 
-/// The flat pins of a net in `connectedPinIterator` order — ⛔ a `PinSet`, so by `PinIdLess`
-/// ([`pin_key`]), not the database's instance-terminals-then-ports order. It decides `net2Pins`
-/// (the pad test and the pad resistor's direction) and the pins' order before `makeSteinerTree`'s
-/// (x, y) sort, hence ties at one location. (`getFirstDriverTerm` walks the database's own lists.)
-fn connected_pins(db: &Db, net: &str) -> Res<Vec<PinLoc>> {
+/// The flat pins of a net in the database's order (instance terminals, then ports), each with
+/// its [`pin_key`]. ⭐ The instance pins in one read for the net (`net_iterm_places`): by pin,
+/// their place, placed flag and id cost two lookups by name each.
+fn connected_pins_keyed(db: &Db, net: &str) -> Res<Vec<(u64, PinLoc)>> {
     let mut out = Vec::new();
-    for it in db.net_iterms(net) {
-        let (inst, term) = it.rsplit_once('/').unwrap_or((&it, ""));
+    let names = db.net_iterms(net);
+    let places = db.net_iterm_places(net);
+    if places.len() != names.len() {
+        return Err(format!("{net}: {} instance pins, {} places", names.len(), places.len()));
+    }
+    for (it, p) in names.into_iter().zip(places) {
         // dbNetwork::location: the terminal's average XY, else the instance's origin.
-        let (x, y) = db.iterm_avg_xy(inst, term).unwrap_or_else(|| (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)));
-        out.push(PinLoc { name: it.clone(), is_port: false, x, y, placed: db.inst_is_placed(inst) });
+        out.push((u64::from(p.id) << 1, PinLoc { name: it, is_port: false, x: p.x, y: p.y, placed: p.placed }));
     }
     for bt in db.net_bterms(net) {
         // A port with no placed pin reads (0, 0).
         let (x, y) = db.bterm_first_pin_location(&bt).unwrap_or((0, 0));
         let status = db.bterm_get_first_pin_placement_status(&bt);
-        out.push(PinLoc { name: bt.clone(), is_port: true, x, y, placed: matches!(status.as_str(), "PLACED" | "FIRM" | "LOCKED" | "COVER") });
+        let pin = PinLoc { name: bt.clone(), is_port: true, x, y, placed: matches!(status.as_str(), "PLACED" | "FIRM" | "LOCKED" | "COVER") };
+        out.push((pin_key(db, &pin)?, pin));
     }
     Ok(out)
 }
 
-/// [`connected_pins`] in `PinSet` order.
+/// The flat pins of a net in `connectedPinIterator` order — ⛔ a `PinSet`, so by `PinIdLess`
+/// ([`pin_key`]), not the database's instance-terminals-then-ports order. It decides `net2Pins`
+/// (the pad test and the pad resistor's direction) and the pins' order before `makeSteinerTree`'s
+/// (x, y) sort, hence ties at one location. (`getFirstDriverTerm` walks the database's own lists.)
 fn connected_pins_by_id(db: &Db, net: &str) -> Res<Vec<PinLoc>> {
-    let mut keyed = connected_pins(db, net)?.into_iter().map(|p| pin_key(db, &p).map(|k| (k, p))).collect::<Res<Vec<_>>>()?;
+    Ok(by_id(connected_pins_keyed(db, net)?))
+}
+
+/// Keyed pins in `PinSet` order ([`connected_pins_by_id`]).
+fn by_id(mut keyed: Vec<(u64, PinLoc)>) -> Vec<PinLoc> {
     keyed.sort_by_key(|(k, _)| *k);
-    Ok(keyed.into_iter().map(|(_, p)| p).collect())
+    keyed.into_iter().map(|(_, p)| p).collect()
 }
 
 /// `dbNetwork::drivers(net)` — ⛔ NOT OpenSTA's visitor over every driver: `dbNetwork` overrides it
@@ -254,11 +264,12 @@ pub fn estimate_net_with_skips(db: &Db, timing: &Timing<'_>, skips: &Skips, net:
 /// `estimateWireParasitic(net)`: the net's first driver, if it has one.
 fn estimate_wire_parasitic(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
     // getFirstDriverTerm walks the database's lists: instance terminals, then block terminals.
-    let db_order = connected_pins(db, net)?;
+    let keyed = connected_pins_keyed(db, net)?;
+    let db_order: Vec<PinLoc> = keyed.iter().map(|(_, p)| p.clone()).collect();
     let Some(drvr) = first_driver_term(db, net, &db_order).cloned() else {
         return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
     };
-    let pins = connected_pins_by_id(db, net)?;
+    let pins = by_id(keyed);
     let decision = estimate_wire_parasitic_drvr(db, timing, skips, net, &drvr, &pins, alpha, stt)?;
     Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
