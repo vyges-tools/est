@@ -193,10 +193,15 @@ fn is_pad_net(db: &Db, pins: &[PinLoc]) -> Res<bool> {
 /// `estimateWireParasitics`: every `dbNet` in block order. A constant driver (`isConstant`, the
 /// logic simulation in `crate::sim`) gets no network; SDC constants are refused before estimation.
 pub fn estimate_wire_parasitics(db: &Db, timing: &Timing<'_>, alpha: f32, stt: SteinerBuilder<'_>) -> Res<Vec<NetEstimate>> {
-    let skips = skips(db, timing)?;
+    estimate_wire_parasitics_with_skips(db, timing, &skips(db, timing)?, alpha, stt)
+}
+
+/// [`estimate_wire_parasitics`] with the clock nets and constant pins the caller holds; they must
+/// describe the design as it is now.
+pub fn estimate_wire_parasitics_with_skips(db: &Db, timing: &Timing<'_>, skips: &Skips, alpha: f32, stt: SteinerBuilder<'_>) -> Res<Vec<NetEstimate>> {
     let mut out = Vec::new();
     for net in db.net_names() {
-        out.push(estimate_wire_parasitic(db, timing, &skips, &net, alpha, stt)?);
+        out.push(estimate_wire_parasitic(db, timing, skips, &net, alpha, stt)?);
     }
     Ok(out)
 }
@@ -226,12 +231,18 @@ impl Skips {
 
 /// The clock nets and the constant pins of the design as it is now (see [`Skips`]).
 pub fn skips(db: &Db, timing: &Timing<'_>) -> Res<Skips> {
+    let empty = crate::liberty::LibertyClocks::default();
+    let values = crate::sim::constant_pins(db, timing.liberty.unwrap_or(&empty)).map_err(|e| e.to_string())?;
+    skips_with_constants(db, timing, &values)
+}
+
+/// [`skips`] from the constant pins the caller already holds (`crate::sim::constant_pins` on the
+/// design as it is now, with the same library): the logic simulation is not run again.
+pub fn skips_with_constants(db: &Db, timing: &Timing<'_>, values: &std::collections::BTreeMap<crate::sim::Pin, bool>) -> Res<Skips> {
     let clock_nets = match timing.liberty {
         Some(lib) if !timing.clock_sources.is_empty() => crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?,
         _ => BTreeSet::new(),
     };
-    let empty = crate::liberty::LibertyClocks::default();
-    let values = crate::sim::constant_pins(db, timing.liberty.unwrap_or(&empty)).map_err(|e| e.to_string())?;
     // STAGE DUMP — every constant pin and its value, to diff against the reference's
     // `sta::pin_sim_logic_value` over the same design.
     if let Some(path) = std::env::var_os("EST_SIM_DUMP") {
