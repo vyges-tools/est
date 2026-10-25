@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use vyges_opendb::Db;
 
-use crate::liberty::{eval_constant, LibertyClocks};
+use crate::liberty::{eval_constant, Expr, LibertyClocks};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -55,6 +55,12 @@ struct Sim<'a> {
     terms: BTreeMap<String, Vec<String>>,
     values: BTreeMap<Pin, bool>,
     queue: VecDeque<String>,
+    /// The constraint value of each pin `set_case_analysis` (first) or `set_logic_*` names:
+    /// `None` for a transition or don't-care, which holds no constant but still blocks one.
+    constraints: BTreeMap<Pin, Option<bool>>,
+    /// `propagateConstants(thru_sequentials)`: whether a sequential output takes its value from
+    /// the sequential's data input (`findLogicConstants` does; `ensureConstantsPropagated` not).
+    thru_sequentials: bool,
 }
 
 fn any_input(dir: &str) -> bool {
@@ -84,8 +90,12 @@ impl Sim<'_> {
         }
     }
 
-    /// `Sim::setPinValue` (no SDC constant can disagree: those are refused before estimation).
+    /// `Sim::setPinValue`: a pin with a constraint value takes no other value (the reference
+    /// warns and keeps the constraint's).
     fn set_pin_value(&mut self, pin: &Pin, value: Option<bool>) {
+        if self.constraints.get(pin).is_some_and(|c| *c != value) {
+            return;
+        }
         if self.values.get(pin).copied() == value {
             return;
         }
@@ -112,7 +122,18 @@ impl Sim<'_> {
         }
     }
 
-    /// `Sim::evalInstance(inst, thru_sequentials = false)`.
+    /// `setConstraintConstPins`: the `set_logic_*` values, then the `set_case_analysis` values.
+    fn set_constraint_const_pins(&mut self, c: &Constraints) {
+        for map in [&c.logic, &c.case] {
+            for (p, v) in map {
+                self.set_pin_value(p, *v);
+            }
+        }
+    }
+
+    /// `Sim::evalInstance(inst, thru_sequentials)`. Through sequentials, an output whose function
+    /// is a lone state variable (`expr->port()`) a sequential drives is that sequential's DATA
+    /// expression, inverted for its inverted output.
     fn eval_instance(&mut self, inst: &str) {
         let master = self.master.get(inst).cloned().unwrap_or_default();
         let Some(cell) = self.lib.cells.get(&master) else { return };
@@ -131,7 +152,7 @@ impl Sim<'_> {
                             None
                         }
                     }
-                    None => eval_constant(f, &|p| known(&self.values, p)),
+                    None => function_value(cell, f, self.thru_sequentials, &|p| known(&self.values, p)),
                 }
             } else if cell.clock_gate_out.contains(term) {
                 // `clockGateOutValue`: 0 when the gated clock or the enable is 0.
@@ -147,8 +168,50 @@ impl Sim<'_> {
     }
 }
 
+/// The value of an output's (non-tristate) function under the known pin values. Through
+/// sequentials, a function that is a lone state variable (`expr->port()`) a sequential drives is
+/// that sequential's DATA expression, inverted for its inverted output (`outputPortSequential`).
+fn function_value(cell: &crate::liberty::CellClock, f: &Expr, thru_sequentials: bool, known: &dyn Fn(&str) -> Option<bool>) -> Option<bool> {
+    match f {
+        Expr::Port(state) if thru_sequentials && cell.seq_outputs.contains_key(state) => {
+            let (data, inverted) = &cell.seq_outputs[state];
+            data.as_ref().and_then(|d| eval_constant(d, known)).map(|v| v != *inverted)
+        }
+        _ => eval_constant(f, known),
+    }
+}
+
 /// `Sim::ensureConstantsPropagated` on a freshly read design: every pin holding a constant.
 pub fn constant_pins(db: &Db, lib: &LibertyClocks) -> Res<BTreeMap<Pin, bool>> {
+    propagate(db, lib, false, &Constraints::default())
+}
+
+/// The constraint constants `seedConstants` reads: `set_logic_*` pins and `set_case_analysis`
+/// pins, each with its value (`None`: a transition or don't-care). A pin in both takes its case
+/// value (`setPinValue` asks the case analysis first).
+#[derive(Clone, Debug, Default)]
+pub struct Constraints {
+    pub logic: BTreeMap<Pin, Option<bool>>,
+    pub case: BTreeMap<Pin, Option<bool>>,
+}
+
+/// [`constant_pins`] under constraints: `Sim::ensureConstantsPropagated` on a freshly read design
+/// with `set_case_analysis` / `set_logic_*` in force.
+pub fn constant_pins_constrained(db: &Db, lib: &LibertyClocks, c: &Constraints) -> Res<BTreeMap<Pin, bool>> {
+    propagate(db, lib, false, c)
+}
+
+/// `Sta::findLogicConstants` (`Sim::findLogicConstants`): the same seeds — the constant-function
+/// pins, then the pins on constant nets; no SDC constant, which that call never reads — propagated
+/// THROUGH sequentials. A pin's value only goes from unknown to a constant, so seeding order does
+/// not change the fixed point.
+pub fn logic_constants(db: &Db, lib: &LibertyClocks) -> Res<BTreeMap<Pin, bool>> {
+    propagate(db, lib, true, &Constraints::default())
+}
+
+fn propagate(db: &Db, lib: &LibertyClocks, thru_sequentials: bool, c: &Constraints) -> Res<BTreeMap<Pin, bool>> {
+    let mut constraints = c.logic.clone();
+    constraints.extend(c.case.iter().map(|(p, v)| (p.clone(), *v)));
     let mut sim = Sim {
         lib,
         net_of: BTreeMap::new(),
@@ -158,6 +221,8 @@ pub fn constant_pins(db: &Db, lib: &LibertyClocks) -> Res<BTreeMap<Pin, bool>> {
         terms: BTreeMap::new(),
         values: BTreeMap::new(),
         queue: VecDeque::new(),
+        constraints,
+        thru_sequentials,
     };
     let mut supply: Vec<(String, bool)> = Vec::new();
     let is_supply = |sig: &str| matches!(sig, "POWER" | "GROUND");
@@ -222,6 +287,7 @@ pub fn constant_pins(db: &Db, lib: &LibertyClocks) -> Res<BTreeMap<Pin, bool>> {
             }
         }
     }
+    sim.set_constraint_const_pins(c);
     // setConstFuncPins: every instance output whose function is a constant (a tie cell).
     let insts: Vec<(String, String)> = sim.master.iter().map(|(i, m)| (i.clone(), m.clone())).collect();
     for (inst, master) in insts {
@@ -238,4 +304,101 @@ pub fn constant_pins(db: &Db, lib: &LibertyClocks) -> Res<BTreeMap<Pin, bool>> {
         sim.eval_instance(&inst);
     }
     Ok(sim.values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(body: &str) -> crate::liberty::CellClock {
+        let mut l = LibertyClocks::default();
+        l.read(&format!("library (t) {{ cell (c) {{ {body} }} }}")).unwrap();
+        l.cells.remove("c").unwrap()
+    }
+
+    const FF: &str = r#"ff ("IQ","IQN") { clocked_on : "CK"; next_state : "D"; }
+        pin (CK) { direction : input; clock : true; } pin (D) { direction : input; }
+        pin (Q) { direction : output; function : "IQ"; } pin (QN) { direction : output; function : "IQN"; }"#;
+
+    /// Rule (`Sim::evalInstance`, `findLogicConstants` = `propagateConstants(true)`): through
+    /// sequentials, Q = IQ is the ff's `next_state` and QN = IQN its inverse; without, both unknown.
+    #[test]
+    fn a_register_output_follows_its_data_only_through_sequentials() {
+        let c = cell(FF);
+        let d0 = |p: &str| (p == "D").then_some(false);
+        let q = c.functions["Q"].clone();
+        let qn = c.functions["QN"].clone();
+        assert_eq!(function_value(&c, &q, true, &d0), Some(false));
+        assert_eq!(function_value(&c, &qn, true, &d0), Some(true));
+        assert_eq!(function_value(&c, &q, false, &d0), None);
+        // An unknown data input leaves the output unknown.
+        assert_eq!(function_value(&c, &q, true, &|_| None), None);
+    }
+
+    /// A latch's `data_in` is its data the same way.
+    #[test]
+    fn a_latch_output_follows_data_in() {
+        let c = cell(r#"latch ("IQ","IQN") { enable : "G"; data_in : "D"; }
+            pin (G) { direction : input; } pin (D) { direction : input; }
+            pin (Q) { direction : output; function : "IQ"; }"#);
+        let d1 = |p: &str| (p == "D").then_some(true);
+        assert_eq!(function_value(&c, &c.functions["Q"].clone(), true, &d1), Some(true));
+    }
+
+    /// `kld` -> u1 (buffer) -> u2 (inverter), as the Sim holds a netlist.
+    fn chain(lib: &LibertyClocks, constraints: BTreeMap<Pin, Option<bool>>) -> Sim<'_> {
+        let it = |i: &str, t: &str| Pin::ITerm(i.into(), t.into());
+        let nets = [("kld", vec![Pin::Port("kld".into()), it("u1", "A")]), ("n1", vec![it("u1", "Z"), it("u2", "A")]), ("n2", vec![it("u2", "ZN")])];
+        let mut sim = Sim {
+            lib,
+            net_of: BTreeMap::new(),
+            pins_of: BTreeMap::new(),
+            dir: BTreeMap::new(),
+            master: [("u1".into(), "buf".into()), ("u2".into(), "inv".into())].into(),
+            terms: [("u1".into(), vec!["A".into(), "Z".into()]), ("u2".into(), vec!["A".into(), "ZN".into()])].into(),
+            values: BTreeMap::new(),
+            queue: VecDeque::new(),
+            constraints,
+            thru_sequentials: false,
+        };
+        for (net, pins) in nets {
+            for p in &pins {
+                sim.net_of.insert(p.clone(), net.into());
+                let d = match p {
+                    Pin::Port(_) => "INPUT",
+                    Pin::ITerm(_, t) if t == "A" => "INPUT",
+                    _ => "OUTPUT",
+                };
+                sim.dir.insert(p.clone(), d.into());
+            }
+            sim.pins_of.insert(net.into(), pins);
+        }
+        sim
+    }
+
+    /// Rule (`Sim::seedConstants` / `setPinValue`): a `set_case_analysis` port value propagates
+    /// like a tie; a pin holding a constraint value takes no other (a don't-care blocks a constant).
+    #[test]
+    fn a_case_value_propagates_and_a_constraint_pin_keeps_its_own() {
+        let mut lib = LibertyClocks::default();
+        lib.read(r#"library (t) {
+            cell (buf) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+            cell (inv) { pin (A) { direction : input; } pin (ZN) { direction : output; function : "!A"; } } }"#)
+            .unwrap();
+        let kld = Pin::Port("kld".into());
+        let run = |constraints: BTreeMap<Pin, Option<bool>>| {
+            let mut sim = chain(&lib, constraints.clone());
+            sim.set_constraint_const_pins(&Constraints { logic: BTreeMap::new(), case: constraints });
+            while let Some(inst) = sim.queue.pop_front() {
+                sim.eval_instance(&inst);
+            }
+            sim.values
+        };
+        let free = run([(kld.clone(), Some(false))].into());
+        assert_eq!(free.get(&Pin::ITerm("u2".into(), "ZN".into())), Some(&true));
+        let held = run([(kld.clone(), Some(false)), (Pin::ITerm("u2".into(), "A".into()), None)].into());
+        assert_eq!(held.get(&Pin::ITerm("u1".into(), "Z".into())), Some(&false));
+        assert_eq!(held.get(&Pin::ITerm("u2".into(), "A".into())), None);
+        assert_eq!(held.get(&Pin::ITerm("u2".into(), "ZN".into())), None);
+    }
 }

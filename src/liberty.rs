@@ -415,6 +415,10 @@ pub struct CellClock {
     /// Ports with `clock_gate_out_pin`, and with `clock_gate_clock_pin` or `clock_gate_enable_pin`.
     pub clock_gate_out: BTreeSet<String>,
     pub clock_gate_in: BTreeSet<String>,
+    /// `outputPortSequential`: each state variable a sequential drives (an ff's or latch's output
+    /// or inverted output), with that sequential's data expression (`next_state` / `data_in`) and
+    /// whether the variable is the INVERTED output. A later group naming the same variable wins.
+    pub(crate) seq_outputs: BTreeMap<String, (Option<Expr>, bool)>,
 }
 
 /// `Sim::evalExpr`: the expression with the instance's known pin values substituted, ZERO or ONE
@@ -674,6 +678,7 @@ fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<C
     // sequential per bit k: clock, data, clear and preset each `bitSubExpr(k)`, its output member k.
     let mut seqs = Vec::new();
     let mut seq_of = BTreeMap::new();
+    let mut seq_outputs = BTreeMap::new();
     for (kind, is_register, clk, data) in
         [("ff", true, "clocked_on", "next_state"), ("ff_bank", true, "clocked_on", "next_state"), ("latch", false, "enable", "data_in")]
     {
@@ -683,7 +688,10 @@ fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<C
             } else {
                 None
             };
-            let outs: Vec<&String> = g.args.iter().take(if size.is_some() { 2 } else { g.args.len() }).filter(|o| !o.is_empty()).collect();
+            // The first named output is the sequential's `output`, the second its `outputInv`.
+            let named: Vec<(usize, &String)> = g.args.iter().take(if size.is_some() { 2 } else { g.args.len() }).enumerate().filter(|(_, o)| !o.is_empty()).collect();
+            let outs: Vec<&String> = named.iter().map(|(_, o)| *o).collect();
+            let inverted: Vec<bool> = named.iter().map(|(i, _)| *i == 1).collect();
             let out_bits: Vec<Vec<String>> = outs.iter().map(|o| size.map_or_else(|| vec![(*o).clone()], |n| bus_bits(o, n - 1, 0))).collect();
             for (o, bits) in outs.iter().zip(&out_bits) {
                 if size.is_some() {
@@ -700,8 +708,13 @@ fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<C
                     None => None,
                 };
                 seqs.push(Seq { is_register, clock, data: set(data)?, clear: set("clear")?, preset: set("preset")? });
-                for bits in &out_bits {
+                let data_expr = match g.attr(data) {
+                    Some(t) => Some(parse_expr(&bit(t)?).map_err(|e| format!("liberty cell {name}: {e}"))?),
+                    None => None,
+                };
+                for (bits, inv) in out_bits.iter().zip(&inverted) {
                     seq_of.insert(bits[k].clone(), seqs.len() - 1);
+                    seq_outputs.insert(bits[k].clone(), (data_expr.clone(), *inv));
                 }
             }
         }
@@ -797,6 +810,7 @@ fn read_cell(cell: &Group, lib_types: &BTreeMap<String, (i32, i32)>) -> Result<C
         tristate,
         clock_gate_out,
         clock_gate_in,
+        seq_outputs,
     })
 }
 
