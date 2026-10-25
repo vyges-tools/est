@@ -12,6 +12,10 @@
 //! - [`placement`] (feature `odb`) — `estimate_parasitics -placement`: which nets get a network,
 //!   and each one's Steiner tree. ⬜ The network itself is not built yet.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_est::…` paths resolve here.
+extern crate self as vyges_est;
+
 pub mod wire;
 pub mod liberty;
 pub mod clk_network;
@@ -20,3 +24,10 @@ pub mod placement;
 pub mod rc;
 pub mod network;
 pub mod spef;
+
+/// The `vyges-est` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
