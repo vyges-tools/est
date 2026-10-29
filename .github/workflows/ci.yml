@@ -24,7 +24,7 @@ permissions:
 jobs:
   lib:
     name: library (no C++)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}
     defaults:
       run:
         working-directory: vyges-tools-est
@@ -51,7 +51,7 @@ jobs:
 
   cli:
     name: engine (build & test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}
     defaults:
       run:
         working-directory: vyges-tools-est
@@ -93,7 +93,7 @@ jobs:
 
   docs:
     name: book
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}
     steps:
       - uses: actions/checkout@v7
       - name: mdBook
