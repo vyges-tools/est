@@ -7,7 +7,8 @@
 //!
 //! The job: `steps`, the case's commands in order as `{cmd, args}` with the arguments as Tcl
 //! evaluated them (`read_lef`, `read_def`, `read_db`, `read_liberty [-corner c]`,
-//! `define_corners`, `create_clock <sources>`, `set_propagated_clock`, `set_layer_rc`,
+//! `define_corners`, `create_clock [-name N] <sources>`, `set_propagated_clock <objects>`,
+//! `set_clock_latency <objects>`, `set_layer_rc`,
 //! `set_wire_rc`, `estimate_parasitics -placement [-spef_file F]`); `alpha` (the Steiner
 //! builder's, 0.3 by default) and `trace` (where to write the RC state and the per-net decisions,
 //! one `VYGE|…` line each).
@@ -16,7 +17,7 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 use vyges_est::liberty::LibertyClocks;
-use vyges_est::placement::{estimate_wire_parasitics, trace, Branch, SttTree, Timing};
+use vyges_est::placement::{estimate_wire_parasitics_with_skips, skips_with_clocks, trace, Branch, ClockObject, Clocks, SttTree, Timing};
 use vyges_est::network::{self, NetCtx};
 use vyges_est::placement::Decision;
 use vyges_est::rc::{Rc, Units};
@@ -40,7 +41,7 @@ fn run(job: &Value) -> Result<Value, String> {
     let mut lib = LibertyClocks::default();
     let mut have_lib = false;
     let mut rc = Rc::new();
-    let (mut clock_sources, mut propagated) = (Vec::new(), false);
+    let mut clocks = Clocks::default();
     let mut trace_text = String::new();
     let mut estimated = 0usize;
     let mut calls = 0usize;
@@ -84,8 +85,22 @@ fn run(job: &Value) -> Result<Value, String> {
                 have_lib = true;
             }
             "define_corners" => rc.define_corners(&args),
-            "create_clock" => clock_sources.extend(args.iter().cloned()),
-            "set_propagated_clock" => propagated = true,
+            // `-name N` first when the recorder knows it; without one the clock is named after
+            // its first source, as the reference names it.
+            "create_clock" => {
+                let (name, sources) = match args.first().map(String::as_str) {
+                    Some("-name") => (args.get(1).cloned().ok_or("create_clock -name")?, args[2..].to_vec()),
+                    _ => (args.first().cloned().unwrap_or_default(), args.clone()),
+                };
+                clocks.create_clock(&name, &sources);
+            }
+            "set_propagated_clock" => clocks.set_propagated_clock(&clock_objects(&db, &clocks, &args)?)?,
+            "set_clock_latency" => {
+                if args.iter().any(|a| a == "-source") {
+                    continue; // an insertion delay: propagation is unchanged
+                }
+                clocks.set_clock_latency(&clock_objects(&db, &clocks, &args)?)?
+            }
             "set_layer_rc" => rc.set_layer_rc(&mut db, units(&lib)?, &args)?,
             // The argument checks first: the reference raises them before converting any value.
             "set_wire_rc" => {
@@ -118,8 +133,11 @@ fn run(job: &Value) -> Result<Value, String> {
                 calls += 1;
                 rc.sort_clk_and_signal_layers();
                 trace_text.push_str(&rc.trace(&tech));
-                let timing = Timing { liberty: have_lib.then_some(&lib), clock_sources: clock_sources.clone(), propagated };
-                let nets = estimate_wire_parasitics(&db, &timing, alpha, &stt)?;
+                let timing = Timing { liberty: have_lib.then_some(&lib), clock_sources: clocks.sources(), propagated: clocks.all_propagated() };
+                // ensureClkNetwork: the clock network is built from the SDC as it stands now.
+                let skips = skips_with_clocks(&db, &timing, &clocks)?;
+                clocks.network_read();
+                let nets = estimate_wire_parasitics_with_skips(&db, &timing, &skips, alpha, &stt)?;
                 estimated += nets.len();
                 trace_text.push_str(&trace(&nets));
                 // -spef_file: one file per corner, `_<corner>` before `.spef` when there are several.
@@ -173,6 +191,28 @@ fn run(job: &Value) -> Result<Value, String> {
 /// `-global_routing` path is. ⛔ In the reference's order: an unplaced design (EST-0009), then
 /// the routes, then a scene without signal wire capacitance (EST-0014, an ERROR here where
 /// `-placement` only warns EST-0018).
+/// The objects a clock command names. `@clock:N` (the recorder's `get_clocks`/`all_clocks`) is a
+/// clock; a name with a `/` or a port's name is a pin; otherwise a clock of that name, or every
+/// clock for `all`.
+fn clock_objects(db: &Db, clocks: &Clocks, args: &[String]) -> Result<Vec<ClockObject>, String> {
+    let ports: std::collections::BTreeSet<String> = db.bterm_names().into_iter().collect();
+    let mut out = Vec::new();
+    for a in args.iter().filter(|a| !a.starts_with('-')) {
+        if let Some(n) = a.strip_prefix("@clock:") {
+            out.push(ClockObject::Clock(n.to_string()));
+        } else if a.contains('/') || ports.contains(a) {
+            out.push(ClockObject::Pin(a.clone()));
+        } else if clocks.clocks().iter().any(|c| &c.name == a) {
+            out.push(ClockObject::Clock(a.clone()));
+        } else if a == "all" {
+            out.extend(clocks.clocks().iter().map(|c| ClockObject::Clock(c.name.clone())));
+        } else {
+            return Err(format!("{a}: neither a clock nor a pin"));
+        }
+    }
+    Ok(out)
+}
+
 fn design_parasitics_src(db: &Db, rc: &Rc, tech: &str) -> Result<(), String> {
     if !design_is_placed(db) {
         return Err("[ERROR EST-0009] The design is not placed: no parasitics to estimate.".into());
@@ -216,7 +256,9 @@ USAGE:
 JOB FIELDS:
   steps     required — the commands in order, each {\"cmd\": ..., \"args\": [...]}:
               read_lef, read_def, read_db, read_liberty [-corner c], define_corners,
-              create_clock <sources>, set_propagated_clock, set_layer_rc, set_wire_rc,
+              create_clock [-name N] <sources>, set_propagated_clock <objects>,
+              set_clock_latency <objects> (per clock and pin: an ideal clock's nets
+              get no network), set_layer_rc, set_wire_rc,
               estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
                 picked as the reference does, placement here; unplaced is EST-0009, no
                 wire capacitance EST-0014)
@@ -519,6 +561,64 @@ mod descriptor_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Reference rule (OpenSTA `ClkNetwork::findClkPins` and `Sdc::setClockLatency` at the 4155ac3
+    /// pin, read by `isSkipPin` when the estimate runs): the ideal clock pins are walked per clock,
+    /// from the clocks that are not propagated. `set_propagated_clock [all_clocks]` then
+    /// `set_clock_latency` on clk2 leaves clk1 propagated and makes clk2 ideal again, so clk2's net
+    /// gets no network and clk1's does. A latency after the network is built is refused (the
+    /// reference reads it stale).
+    #[test]
+    fn a_clock_made_ideal_by_its_latency_is_skipped_and_the_other_is_not() {
+        const LEF: &str = "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\n\
+            LAYER metal1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.2 ;\n  WIDTH 0.1 ;\nEND metal1\n\
+            SITE core\n  CLASS CORE ;\n  SIZE 0.2 BY 1.4 ;\nEND core\n\
+            MACRO BUF\n  CLASS CORE ;\n  ORIGIN 0 0 ;\n  SIZE 1 BY 1.4 ;\n  SITE core ;\n\
+            PIN A\n    DIRECTION INPUT ;\n    PORT\n      LAYER metal1 ;\n        RECT 0 0 0.1 0.1 ;\n    END\n  END A\n\
+            PIN Z\n    DIRECTION OUTPUT ;\n    PORT\n      LAYER metal1 ;\n        RECT 0.5 0 0.6 0.1 ;\n    END\n  END Z\nEND BUF\nEND LIBRARY\n";
+        const DEF: &str = "VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\nDESIGN top ;\nUNITS DISTANCE MICRONS 1000 ;\n\
+            DIEAREA ( 0 0 ) ( 10000 10000 ) ;\nCOMPONENTS 2 ;\n  - u1 BUF + PLACED ( 3000 1000 ) N ;\n  - u2 BUF + PLACED ( 3000 6000 ) N ;\nEND COMPONENTS\n\
+            PINS 2 ;\n  - clk1 + NET clk1 + DIRECTION INPUT + USE SIGNAL\n    + LAYER metal1 ( 0 0 ) ( 100 100 )\n    + PLACED ( 0 1000 ) N ;\n\
+              - clk2 + NET clk2 + DIRECTION INPUT + USE SIGNAL\n    + LAYER metal1 ( 0 0 ) ( 100 100 )\n    + PLACED ( 0 6000 ) N ;\nEND PINS\n\
+            NETS 2 ;\n  - clk1 ( PIN clk1 ) ( u1 A ) ;\n  - clk2 ( PIN clk2 ) ( u2 A ) ;\nEND NETS\nEND DESIGN\n";
+        const LIB: &str = r#"library (t) { capacitive_load_unit (1,ff); pulling_resistance_unit : "1kohm";
+            cell (BUF) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A";
+              timing () { related_pin : "A"; } } } }"#;
+        let dir = std::env::temp_dir().join(format!("vyges-est-clk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (lef, def, lib, tr) = (dir.join("t.lef"), dir.join("t.def"), dir.join("t.lib"), dir.join("t.vyge"));
+        std::fs::write(&lef, LEF).unwrap();
+        std::fs::write(&def, DEF).unwrap();
+        std::fs::write(&lib, LIB).unwrap();
+        let p = |x: &std::path::PathBuf| x.to_str().unwrap().to_string();
+        let job = |tail: Vec<serde_json::Value>| {
+            let mut steps = vec![
+                json!({ "cmd": "read_lef", "args": [p(&lef)] }),
+                json!({ "cmd": "read_def", "args": [p(&def)] }),
+                json!({ "cmd": "read_liberty", "args": [p(&lib)] }),
+                json!({ "cmd": "create_clock", "args": ["-name", "clk1", "clk1"] }),
+                json!({ "cmd": "create_clock", "args": ["-name", "clk2", "clk2"] }),
+                json!({ "cmd": "set_propagated_clock", "args": ["@clock:clk1", "@clock:clk2"] }),
+            ];
+            steps.extend(tail);
+            json!({ "steps": steps, "trace": p(&tr) })
+        };
+        let rc = json!({ "cmd": "set_wire_rc", "args": ["-resistance", "0.0357", "-capacitance", "0.0752"] });
+        let est = json!({ "cmd": "estimate_parasitics", "args": ["-placement"] });
+        let latency = json!({ "cmd": "set_clock_latency", "args": ["@clock:clk2"] });
+        run(&job(vec![latency.clone(), rc.clone(), est.clone()])).unwrap();
+        let t = std::fs::read_to_string(&tr).unwrap();
+        assert!(t.contains("VYGE|skip|clk2\n"), "clk2 is ideal again:\n{t}");
+        assert!(!t.contains("VYGE|skip|clk1\n") && t.contains("VYGE|tree|clk1|"), "clk1 stays propagated:\n{t}");
+        // Without the latency both clocks are propagated: neither is skipped.
+        run(&job(vec![rc.clone(), est.clone()])).unwrap();
+        let t = std::fs::read_to_string(&tr).unwrap();
+        assert!(!t.contains("VYGE|skip|"), "{t}");
+        // A latency once the network is built is read stale by the reference: refused.
+        let stale = run(&job(vec![rc, est.clone(), latency, est])).unwrap_err();
+        assert!(stale.contains("stale"), "{stale}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The assertion passes on the pass word, and ONLY the pass word exits 0.
     #[test]
     fn only_estimated_passes_and_exits_zero() {
@@ -551,7 +651,7 @@ mod descriptor_tests {
             assert!(USAGE.contains(w), "USAGE is missing `{w}`");
         }
         for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "create_clock",
-                     "set_propagated_clock", "set_layer_rc", "set_wire_rc", "estimate_parasitics"] {
+                     "set_propagated_clock", "set_clock_latency", "set_layer_rc", "set_wire_rc", "estimate_parasitics"] {
             assert!(USAGE.contains(step), "USAGE does not name the `{step}` step");
             assert!(include_str!("main.rs").contains(&format!("\"{step}\" =>")), "`{step}` is not a step");
         }

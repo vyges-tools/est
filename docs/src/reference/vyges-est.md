@@ -14,7 +14,9 @@ USAGE:
 JOB FIELDS:
   steps     required — the commands in order, each {"cmd": ..., "args": [...]}:
               read_lef, read_def, read_db, read_liberty [-corner c], define_corners,
-              create_clock <sources>, set_propagated_clock, set_layer_rc, set_wire_rc,
+              create_clock [-name N] <sources>, set_propagated_clock <objects>,
+              set_clock_latency <objects> (per clock and pin: an ideal clock's nets
+              get no network), set_layer_rc, set_wire_rc,
               estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
                 picked as the reference does, placement here; unplaced is EST-0009, no
                 wire capacitance EST-0014)

@@ -243,6 +243,8 @@ fn estimate_work(db: &Db, timing: &Timing<'_>, skips: &Skips, w: Work, alpha: f3
 #[derive(Debug, Clone)]
 pub struct Skips {
     clock_nets: BTreeSet<String>,
+    /// The nets of the ideal clock pins: the ones `isSkipPin` skips.
+    ideal_clock_nets: BTreeSet<String>,
     constants: BTreeSet<String>,
 }
 
@@ -250,6 +252,10 @@ impl Skips {
     /// The nets on the clock network.
     pub fn clock_nets(&self) -> &BTreeSet<String> {
         &self.clock_nets
+    }
+    /// The nets on the IDEAL clock network: those an estimate skips.
+    pub fn ideal_clock_nets(&self) -> &BTreeSet<String> {
+        &self.ideal_clock_nets
     }
     /// The pins (`inst/pin` or a port) the logic simulation holds constant.
     pub fn constant_pins(&self) -> &BTreeSet<String> {
@@ -279,7 +285,115 @@ pub fn skips_with_constants(db: &Db, timing: &Timing<'_>, values: &std::collecti
         std::fs::write(path, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
     }
     let constants = values.keys().map(|p| p.path_name()).collect();
-    Ok(Skips { clock_nets, constants })
+    // One flag for every clock: all of them ideal, or none.
+    let ideal_clock_nets = if timing.propagated { BTreeSet::new() } else { clock_nets.clone() };
+    Ok(Skips { clock_nets, ideal_clock_nets, constants })
+}
+
+/// [`skips`] with the clocks' propagation taken per clock and per pin, as the SDC left it.
+pub fn skips_with_clocks(db: &Db, timing: &Timing<'_>, clocks: &Clocks) -> Res<Skips> {
+    let mut s = skips(db, timing)?;
+    s.ideal_clock_nets = match timing.liberty {
+        Some(lib) if !timing.clock_sources.is_empty() => {
+            crate::clk_network::find_ideal_clk_nets(db, lib, &timing.clock_sources, &clocks.ideal_sources(), &clocks.propagated_pins).map_err(|e| e.to_string())?
+        }
+        _ => BTreeSet::new(),
+    };
+    Ok(s)
+}
+
+/// One `create_clock`: its name, its source ports, and whether it is propagated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockDef {
+    pub name: String,
+    pub sources: Vec<String>,
+    pub propagated: bool,
+}
+
+/// The SDC clock state the clock network is built from, changed command by command in the order
+/// the script ran them.
+///
+/// 🔑 Reference rule (OpenSTA at the 4155ac3 pin): a fresh clock is ideal (the default of
+/// `propagate_all_clocks`) and a named redefinition keeps its propagation; `set_propagated_clock`
+/// propagates the clocks or pins it names; `set_clock_latency` without `-source` makes the clock or
+/// pins it names ideal again (with `-source` it is an insertion delay and changes nothing here).
+/// ⚠️ The latency does NOT invalidate a clock network already built: the next read of it is stale
+/// until a clock is made or a propagation set. [`Clocks::set_clock_latency`] refuses that case.
+#[derive(Debug, Clone, Default)]
+pub struct Clocks {
+    clocks: Vec<ClockDef>,
+    propagated_pins: BTreeSet<String>,
+    /// The clock network was built and nothing has invalidated it since.
+    network_built: bool,
+}
+
+/// What a clock command names: a clock, or a pin (a port's name, or `inst/term`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClockObject {
+    Clock(String),
+    Pin(String),
+}
+
+impl Clocks {
+    /// The clocks, in definition order.
+    pub fn clocks(&self) -> &[ClockDef] {
+        &self.clocks
+    }
+    /// Every clock's source ports.
+    pub fn sources(&self) -> Vec<String> {
+        self.clocks.iter().flat_map(|c| c.sources.iter().cloned()).collect()
+    }
+    /// The sources of the clocks that are not propagated.
+    pub fn ideal_sources(&self) -> Vec<String> {
+        self.clocks.iter().filter(|c| !c.propagated).flat_map(|c| c.sources.iter().cloned()).collect()
+    }
+    /// True when every clock is propagated (and there is one).
+    pub fn all_propagated(&self) -> bool {
+        !self.clocks.is_empty() && self.clocks.iter().all(|c| c.propagated)
+    }
+    /// `create_clock -name name sources`: a fresh clock is ideal; a redefinition keeps propagation.
+    pub fn create_clock(&mut self, name: &str, sources: &[String]) {
+        match self.clocks.iter_mut().find(|c| c.name == name) {
+            Some(c) => c.sources = sources.to_vec(),
+            None => self.clocks.push(ClockDef { name: name.to_string(), sources: sources.to_vec(), propagated: false }),
+        }
+        self.network_built = false;
+    }
+    /// `set_propagated_clock objects`.
+    pub fn set_propagated_clock(&mut self, objects: &[ClockObject]) -> Result<(), String> {
+        for o in objects {
+            match o {
+                ClockObject::Clock(n) => self.clock_mut(n)?.propagated = true,
+                ClockObject::Pin(p) => {
+                    self.propagated_pins.insert(p.clone());
+                }
+            }
+        }
+        self.network_built = false;
+        Ok(())
+    }
+    /// `set_clock_latency delay objects` (no `-source`).
+    pub fn set_clock_latency(&mut self, objects: &[ClockObject]) -> Result<(), String> {
+        if self.network_built {
+            return Err("set_clock_latency after the clock network was built: the reference reads it stale until the network is invalidated — not modelled".into());
+        }
+        for o in objects {
+            match o {
+                ClockObject::Clock(n) => self.clock_mut(n)?.propagated = false,
+                ClockObject::Pin(p) => {
+                    self.propagated_pins.remove(p);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// An estimate built the clock network (`ensureClkNetwork`).
+    pub fn network_read(&mut self) {
+        self.network_built = true;
+    }
+    fn clock_mut(&mut self, name: &str) -> Result<&mut ClockDef, String> {
+        self.clocks.iter_mut().find(|c| c.name == name).ok_or_else(|| format!("clock {name} not found"))
+    }
 }
 
 /// `estimateWireParasitic(drvr_pin, net)` for ONE net, from the driver the caller names — what
@@ -320,13 +434,13 @@ fn estimate_wire_parasitic_drvr(db: &Db, timing: &Timing<'_>, skips: &Skips, net
 
 /// `estimateWireParasiticSteiner`, up to the tree: `isSkipPin(driver)`, then `makeSteinerTree`.
 ///
-/// `isSkipPin`: a pin that is a clock (in the clock network — its net is one `findClkNets`
-/// reaches) and ideal (no `set_propagated_clock`) gets no network; nor does a pin the logic
+/// `isSkipPin`: a pin on the IDEAL clock network (its net is one the ideal-only walk reaches, per
+/// clock and per pin — see [`Clocks`]) gets no network; nor does a pin the logic
 /// simulation holds constant (a tie cell's output, or logic a constant decides — see `crate::sim`).
 /// No SDC constant or disabled pin reaches here: those are refused before estimation.
 #[allow(clippy::too_many_arguments)]
 fn estimate_wire_parasitic_steiner(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, drvr: &PinLoc, pins: &[PinLoc], alpha: f32, stt: SteinerBuilder<'_>) -> Res<Decision> {
-    if skips.clock_nets.contains(net) && !timing.propagated {
+    if skips.ideal_clock_nets.contains(net) {
         return Ok(Decision::Skip);
     }
     if skips.constants.contains(&drvr.name) {
@@ -434,6 +548,25 @@ mod tests {
     fn est(net: &str, decision: Decision) -> NetEstimate {
         let drivers = usize::from(!matches!(decision, Decision::NoDriver));
         NetEstimate { net: net.into(), drivers, drvr: (drivers == 1).then(|| format!("{net}_d")), decision }
+    }
+
+    /// Reference rule (OpenSTA `Sdc::makeClock` at the 4155ac3 pin): a fresh clock is ideal, a
+    /// named redefinition keeps its propagation; a latency on a pin removes that pin's propagation
+    /// and leaves the clock's.
+    #[test]
+    fn a_redefined_clock_keeps_its_propagation() {
+        let mut c = Clocks::default();
+        c.create_clock("a", &["pa".into()]);
+        c.create_clock("b", &["pb".into()]);
+        assert_eq!(c.ideal_sources(), ["pa", "pb"], "fresh clocks are ideal");
+        c.set_propagated_clock(&[ClockObject::Clock("a".into()), ClockObject::Pin("u1/Z".into())]).unwrap();
+        c.create_clock("a", &["pa2".into()]);
+        assert_eq!(c.ideal_sources(), ["pb"], "the redefinition of a keeps it propagated");
+        assert_eq!(c.sources(), ["pa2", "pb"]);
+        c.set_clock_latency(&[ClockObject::Pin("u1/Z".into())]).unwrap();
+        assert!(c.propagated_pins.is_empty());
+        assert_eq!(c.ideal_sources(), ["pb"], "a pin latency leaves the clock propagated");
+        assert!(c.set_propagated_clock(&[ClockObject::Clock("nope".into())]).is_err());
     }
 
     /// Reference rule (estimateWireParasitics at the 4155ac3 pin): the work list, every net with

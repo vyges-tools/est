@@ -37,6 +37,29 @@ enum Pin {
 
 /// `findClkNets` for clocks defined on the top-level ports `sources`, in the database's net names.
 pub fn find_clk_nets(db: &Db, lib: &LibertyClocks, sources: &[String]) -> Res<BTreeSet<String>> {
+    find_clk_pins(db, lib, sources, sources, &BTreeSet::new())
+}
+
+/// The nets of the IDEAL clock pins (`ClkNetwork::findClkPins(ideal_only)`), in net names.
+///
+/// 🔑 Reference rule (OpenSTA at the 4155ac3 pin): the ideal walk starts only from the clocks that
+/// are NOT propagated, and from each such clock's source pins that are not themselves propagated;
+/// a propagated pin it reaches is neither marked nor walked through. Every clock's source pins,
+/// propagated or not, still stop the walk (`isLeafPinClock`). `all_sources` are every clock's
+/// sources, `ideal_sources` those of the clocks not propagated, `propagated_pins` the pins
+/// `set_propagated_clock` named (a port's name, or `inst/term`).
+pub fn find_ideal_clk_nets(db: &Db, lib: &LibertyClocks, all_sources: &[String], ideal_sources: &[String], propagated_pins: &BTreeSet<String>) -> Res<BTreeSet<String>> {
+    find_clk_pins(db, lib, all_sources, ideal_sources, propagated_pins)
+}
+
+fn pin_name(p: &Pin) -> String {
+    match p {
+        Pin::Port(n) => n.clone(),
+        Pin::ITerm(i, t) => format!("{i}/{t}"),
+    }
+}
+
+fn find_clk_pins(db: &Db, lib: &LibertyClocks, sources: &[String], start: &[String], propagated: &BTreeSet<String>) -> Res<BTreeSet<String>> {
     // The netlist as the graph sees it: each pin's net, each net's drivers and loads.
     let mut net_of: BTreeMap<Pin, String> = BTreeMap::new();
     let mut drivers: BTreeMap<String, Vec<Pin>> = BTreeMap::new();
@@ -89,9 +112,12 @@ pub fn find_clk_nets(db: &Db, lib: &LibertyClocks, sources: &[String]) -> Res<BT
     let mut visited: BTreeSet<Pin> = BTreeSet::new();
     let mut queue: VecDeque<Pin> = VecDeque::new();
     let mut inst_edges: Vec<(Pin, Pin)> = Vec::new();
-    for s in &leaf {
+    for s in start.iter().map(|s| Pin::Port(s.clone())) {
+        if !leaf.contains(&s) || propagated.contains(&pin_name(&s)) {
+            continue;
+        }
         if visited.insert(s.clone()) {
-            queue.push_back(s.clone());
+            queue.push_back(s);
         }
     }
     while let Some(pin) = queue.pop_front() {
@@ -123,6 +149,9 @@ pub fn find_clk_nets(db: &Db, lib: &LibertyClocks, sources: &[String]) -> Res<BT
         for to in fanout {
             if leaf.contains(&to) {
                 continue; // searchTo: never into a clock's source pin
+            }
+            if propagated.contains(&pin_name(&to)) {
+                continue; // a propagated pin is not an ideal clock pin, nor walked through
             }
             if visited.insert(to.clone()) {
                 queue.push_back(to);
