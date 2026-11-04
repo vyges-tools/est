@@ -225,30 +225,66 @@ pub struct NetParasitics<'a> {
 pub fn estimate_net(net: &NetParasitics<'_>, rc: &LayerRC) -> Network {
     let mut g = Network::default();
     let mut map: NodeMap = BTreeMap::new();
-    make_route_parasitics(net, rc, &mut g, &mut map);
+    let centers = find_pin_centers(net.pins);
+    make_route_parasitics(net, rc, &centers, &mut g, &mut map);
     for pin in net.pins {
-        make_partial_parasitics_to_pin(net, pin, rc, &mut g, &mut map);
+        make_partial_parasitics_to_pin(net, pin, rc, &centers, &mut g, &mut map);
     }
     g
+}
+
+/// Per net: a gcell's grid point -> the point its wires run to.
+type PinCenters = BTreeMap<(i32, i32), (i32, i32)>;
+
+/// `findPinCenters` (OpenROAD fb6a7f31b0a, in at 4155ac3): a gcell holding pins of the net is
+/// reached at the MEDIAN of those pins, x and y taken apart, not at its center — routes run
+/// between gcell centers, and a star through the center overestimates a short net many times.
+/// ⚠️ The median is the element at index `n / 2` of the sorted values (`nth_element`), the UPPER
+/// middle for an even count.
+fn find_pin_centers(pins: &[PinGridLocation]) -> PinCenters {
+    let mut by_grid: BTreeMap<(i32, i32), (Vec<i32>, Vec<i32>)> = BTreeMap::new();
+    for pin in pins {
+        let (xs, ys) = by_grid.entry(pin.grid_pt).or_default();
+        xs.push(pin.pt.0);
+        ys.push(pin.pt.1);
+    }
+    let median = |v: &mut Vec<i32>| {
+        let mid = v.len() / 2;
+        *v.select_nth_unstable(mid).1
+    };
+    by_grid.into_iter().map(|(grid, (mut xs, mut ys))| (grid, (median(&mut xs), median(&mut ys)))).collect()
+}
+
+/// `routePoint`: the point a wire at this grid point runs to — the pins' median where the gcell
+/// holds pins of the net ([`find_pin_centers`]), else the grid point itself.
+fn route_point(centers: &PinCenters, grid_pt: (i32, i32)) -> (i32, i32) {
+    centers.get(&grid_pt).copied().unwrap_or(grid_pt)
+}
+
+fn manhattan(a: (i32, i32), b: (i32, i32)) -> i32 {
+    (a.0 - b.0).abs() + (a.1 - b.1).abs()
 }
 
 /// `makeRouteParasitics`: a node per end, a resistor between them, half the capacitance each end.
 ///
 /// ⛔ An end BELOW the minimum routing layer has no node unless the segment is a via, and a
 /// segment with either end missing is skipped — the route stays disconnected there.
-fn make_route_parasitics(net: &NetParasitics<'_>, rc: &LayerRC, g: &mut Network, map: &mut NodeMap) {
+fn make_route_parasitics(net: &NetParasitics<'_>, rc: &LayerRC, centers: &PinCenters, g: &mut Network, map: &mut NodeMap) {
     for seg in net.route {
-        let wire_length_dbu = seg.length();
         let valid = |layer: i32| layer >= net.min_routing_layer || seg.is_via();
         let n1 = valid(seg.init_layer).then(|| ensure_point_node(map, seg.init_x, seg.init_y, seg.init_layer));
         let n2 = valid(seg.final_layer).then(|| ensure_point_node(map, seg.final_x, seg.final_y, seg.final_layer));
         let (Some(n1), Some(n2)) = (n1, n2) else { continue };
         let (mut res, mut cap) = (0.0f32, 0.0f32);
-        if wire_length_dbu == 0 {
+        if seg.is_via() {
             // A via: the cut layer above the LOWER of the two routing layers.
             res = rc.cut_layer_res_above(seg.init_layer.min(seg.final_layer));
         } else if seg.init_layer == seg.final_layer {
-            (res, cap) = rc.layer_rc(wire_length_dbu, seg.init_layer, net.ndr_width.and_then(|m| m.get(&seg.init_layer).copied()));
+            // ⛔ (fb6a7f31b0a) the length runs between the two ends' ROUTE points, and the
+            // resistance is floored at 1e-3 as a pin's is: two ends moved to their pins can meet.
+            let length_dbu = manhattan(route_point(centers, (seg.init_x, seg.init_y)), route_point(centers, (seg.final_x, seg.final_y)));
+            (res, cap) = rc.layer_rc(length_dbu, seg.init_layer, net.ndr_width.and_then(|m| m.get(&seg.init_layer).copied()));
+            res = res.max(1.0e-3);
         } else {
             g.warnings.push(format!("EST-0025: Non wire or via route found on net {}.", net.name));
         }
@@ -266,7 +302,7 @@ fn make_route_parasitics(net: &NetParasitics<'_>, rc: &LayerRC, g: &mut Network,
 /// reached through a via, whose cut resistance (the layer BELOW that one) is lumped into the same
 /// resistor; otherwise the pin's own layer is used and there is no via.
 /// ⚠️ The resistance is floored at 1e-3 so a pin sitting on its grid node still has one.
-fn make_partial_parasitics_to_pin(net: &NetParasitics<'_>, pin: &PinGridLocation, rc: &LayerRC, g: &mut Network, map: &mut NodeMap) {
+fn make_partial_parasitics_to_pin(net: &NetParasitics<'_>, pin: &PinGridLocation, rc: &LayerRC, centers: &PinCenters, g: &mut Network, map: &mut NodeMap) {
     let pin_node = NodeId::Pin(pin.name.clone());
     let mut layer = match net.attach {
         PinAttach::Planar => net.net_min_layer + 1,
@@ -285,7 +321,8 @@ fn make_partial_parasitics_to_pin(net: &NetParasitics<'_>, pin: &PinGridLocation
         g.warnings.push(format!("EST-0350: Missing route to pin {}.", pin.name));
         return;
     };
-    let wire_length_dbu = (pin.pt.0 - pin.grid_pt.0).abs() + (pin.pt.1 - pin.grid_pt.1).abs();
+    // (fb6a7f31b0a) to its grid point's ROUTE point, not the gcell center
+    let wire_length_dbu = manhattan(pin.pt, route_point(centers, pin.grid_pt));
     let (res, cap) = rc.layer_rc(wire_length_dbu, layer, net.ndr_width.and_then(|m| m.get(&layer).copied()));
     g.incr_cap(&pin_node, (f64::from(cap) / 2.0) as f32);
     let pin_grid_r = (res + via_res).max(1.0e-3);
@@ -381,7 +418,8 @@ mod tests {
         let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
         let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
-        let (r, c) = rc.layer_rc(500, 2, None);
+        // the lone pin of its gcell is that gcell's route point: no wire, only the via
+        let (r, c) = rc.layer_rc(0, 2, None);
         assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), r + 4.5)));
         assert_eq!(g.nodes.iter().find(|(n, _)| *n == NodeId::Pin("i/A".into())).map(|(_, c)| *c), Some(c / 2.0));
     }
@@ -412,8 +450,8 @@ mod tests {
         let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
         let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
-        let (r, _) = rc.layer_rc(500, 1, None);
-        assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), r)));
+        // no via resistance: the lone pin's wire has length zero, so only the floor remains
+        assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), 1.0e-3)));
     }
 
     // ⚠️ A pin on its own grid node still gets a resistor: the floor.
@@ -437,5 +475,40 @@ mod tests {
         let g = estimate_net(&net, &rc);
         assert!(g.warnings.iter().any(|w| w.contains("EST-0350")), "{:?}", g.warnings);
         assert!(!g.nodes.iter().any(|(n, _)| *n == NodeId::Pin("i/A".into())));
+    }
+
+    fn pin(name: &str, pt: (i32, i32), grid_pt: (i32, i32)) -> PinGridLocation {
+        PinGridLocation { name: name.into(), is_port: false, is_driver: false, pt, grid_pt, conn_layer: 1 }
+    }
+
+    // Rule (`findPinCenters`, OpenROAD fb6a7f31b0a): per gcell, the median of the net's pins in
+    // it, x and y apart; `nth_element` at n/2, the UPPER middle of an even count.
+    #[test]
+    fn a_gcell_with_pins_is_reached_at_their_median() {
+        let pins = [pin("a", (10, 7), (0, 0)), pin("b", (30, 1), (0, 0)), pin("c", (20, 4), (0, 0)), pin("d", (5, 5), (100, 0))];
+        let c = find_pin_centers(&pins);
+        assert_eq!(c[&(0, 0)], (20, 4));
+        assert_eq!(c[&(100, 0)], (5, 5));
+        let even = [pin("a", (1, 0), (0, 0)), pin("b", (2, 0), (0, 0)), pin("c", (3, 0), (0, 0)), pin("d", (4, 0), (0, 0))];
+        assert_eq!(find_pin_centers(&even)[&(0, 0)].0, 3);
+        // a grid point holding no pin is its own route point
+        assert_eq!(route_point(&c, (500, 500)), (500, 500));
+    }
+
+    // Rule (`makeRouteParasitics`, fb6a7f31b0a): a wire runs between its ends' ROUTE points, and
+    // its resistance is floored at 1e-3 (two ends moved onto one point would otherwise be 0).
+    #[test]
+    fn a_wire_runs_between_route_points_and_is_floored() {
+        let rc = rc();
+        let route = [seg(0, 0, 1, 1000, 0, 1)];
+        let pins = [pin("i/A", (100, 0), (0, 0)), pin("j/A", (900, 0), (1000, 0))];
+        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
+        let g = estimate_net(&net, &rc);
+        let (r, _) = rc.layer_rc(800, 1, None);
+        assert_eq!(g.resistors[0], (NodeId::Point(0), NodeId::Point(1), r));
+        let met = [pin("i/A", (500, 0), (0, 0)), pin("j/A", (500, 0), (1000, 0))];
+        let g = estimate_net(&NetParasitics { pins: &met, ..net.clone() }, &rc);
+        assert_eq!(g.resistors[0], (NodeId::Point(0), NodeId::Point(1), 1.0e-3));
+        assert_eq!(g.nodes[0].1, 0.0);
     }
 }
