@@ -511,7 +511,7 @@ dependencies = [
 [[package]]
 name = "vyges-stt"
 version = "0.1.52"
-source = "git+https://github.com/vyges-tools/stt.git?branch=main#228a5c64758c20d6201d0b963a0a8e408ab80c48"
+source = "git+https://github.com/vyges-tools/stt.git?branch=main#513330a1a9705da1851d6a30dbb68b16394d2fa9"
 dependencies = [
  "serde_json",
  "vyges-events",
