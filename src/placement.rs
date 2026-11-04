@@ -198,12 +198,40 @@ pub fn estimate_wire_parasitics(db: &Db, timing: &Timing<'_>, alpha: f32, stt: S
 
 /// [`estimate_wire_parasitics`] with the clock nets and constant pins the caller holds; they must
 /// describe the design as it is now.
+///
+/// 🔑 Two stages, in the reference's order: every net's first driver is found in one pass over
+/// the block BEFORE any net is estimated (the reference builds its work list ahead of its threads),
+/// then each net with a driver is estimated in that list's order.
 pub fn estimate_wire_parasitics_with_skips(db: &Db, timing: &Timing<'_>, skips: &Skips, alpha: f32, stt: SteinerBuilder<'_>) -> Res<Vec<NetEstimate>> {
-    let mut out = Vec::new();
-    for net in db.net_names() {
-        out.push(estimate_wire_parasitic(db, timing, skips, &net, alpha, stt)?);
-    }
-    Ok(out)
+    let work = find_work(db)?;
+    work.into_iter().map(|w| estimate_work(db, timing, skips, w, alpha, stt)).collect()
+}
+
+/// One net of the work list: its first driver (`None` without one) and its pins by id.
+struct Work {
+    net: String,
+    drvr: Option<PinLoc>,
+    pins: Vec<PinLoc>,
+}
+
+/// The work list, every `dbNet` in block order with its first driver.
+fn find_work(db: &Db) -> Res<Vec<Work>> {
+    db.net_names().into_iter().map(|net| {
+        // getFirstDriverTerm walks the database's lists: instance terminals, then block terminals.
+        let keyed = connected_pins_keyed(db, &net)?;
+        let db_order: Vec<PinLoc> = keyed.iter().map(|(_, p)| p.clone()).collect();
+        let drvr = first_driver_term(db, &net, &db_order).cloned();
+        Ok(Work { net, drvr, pins: by_id(keyed) })
+    }).collect()
+}
+
+/// `estimateWireParasitic(drvr, net)` for one work-list entry; a net with no driver gets nothing.
+fn estimate_work(db: &Db, timing: &Timing<'_>, skips: &Skips, w: Work, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
+    let Some(drvr) = w.drvr else {
+        return Ok(NetEstimate { net: w.net, drivers: 0, drvr: None, decision: Decision::NoDriver });
+    };
+    let decision = estimate_wire_parasitic_drvr(db, timing, skips, &w.net, &drvr, &w.pins, alpha, stt)?;
+    Ok(NetEstimate { net: w.net, drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
 
 /// What `isSkipPin` reads: the nets `findClkNets` reaches from the clock sources (none without a
@@ -268,19 +296,6 @@ pub fn estimate_net_with_skips(db: &Db, timing: &Timing<'_>, skips: &Skips, net:
     let Some(drvr) = pins.iter().find(|p| p.name == drvr_pin).cloned() else {
         return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
     };
-    let decision = estimate_wire_parasitic_drvr(db, timing, skips, net, &drvr, &pins, alpha, stt)?;
-    Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
-}
-
-/// `estimateWireParasitic(net)`: the net's first driver, if it has one.
-fn estimate_wire_parasitic(db: &Db, timing: &Timing<'_>, skips: &Skips, net: &str, alpha: f32, stt: SteinerBuilder<'_>) -> Res<NetEstimate> {
-    // getFirstDriverTerm walks the database's lists: instance terminals, then block terminals.
-    let keyed = connected_pins_keyed(db, net)?;
-    let db_order: Vec<PinLoc> = keyed.iter().map(|(_, p)| p.clone()).collect();
-    let Some(drvr) = first_driver_term(db, net, &db_order).cloned() else {
-        return Ok(NetEstimate { net: net.to_string(), drivers: 0, drvr: None, decision: Decision::NoDriver });
-    };
-    let pins = by_id(keyed);
     let decision = estimate_wire_parasitic_drvr(db, timing, skips, net, &drvr, &pins, alpha, stt)?;
     Ok(NetEstimate { net: net.to_string(), drivers: 1, drvr: Some(drvr.name.clone()), decision })
 }
@@ -377,8 +392,11 @@ pub fn trace(nets: &[NetEstimate]) -> String {
         format!("VYGE|pins|{net}|drvr_idx={}|{ps}\n", drvr_idx.map_or(-1, |i| i as i64))
     };
     let mut t = String::new();
+    // The work list is built for every net before any is estimated: its lines come first.
     for n in nets {
         t.push_str(&format!("VYGE|net|{}|drivers={}|drvr={}\n", n.net, n.drivers, n.drvr.as_deref().unwrap_or("")));
+    }
+    for n in nets {
         let kind = match &n.decision {
             Decision::NoDriver => continue,
             Decision::Power => "power",
@@ -407,4 +425,31 @@ pub fn trace(nets: &[NetEstimate]) -> String {
         }
     }
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn est(net: &str, decision: Decision) -> NetEstimate {
+        let drivers = usize::from(!matches!(decision, Decision::NoDriver));
+        NetEstimate { net: net.into(), drivers, drvr: (drivers == 1).then(|| format!("{net}_d")), decision }
+    }
+
+    /// Reference rule (estimateWireParasitics at the 4155ac3 pin): the work list, every net with
+    /// its first driver, is built in one pass before the per-net estimates run, so every net's
+    /// driver line precedes the first net's estimate.
+    #[test]
+    fn every_driver_is_found_before_any_net_is_estimated() {
+        let t = trace(&[est("a", Decision::Skip), est("p", Decision::NoDriver), est("b", Decision::Power)]);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines, [
+            "VYGE|net|a|drivers=1|drvr=a_d",
+            "VYGE|net|p|drivers=0|drvr=",
+            "VYGE|net|b|drivers=1|drvr=b_d",
+            "VYGE|kind|a|steiner",
+            "VYGE|skip|a",
+            "VYGE|kind|b|power",
+        ]);
+    }
 }
