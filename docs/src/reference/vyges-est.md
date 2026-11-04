@@ -15,7 +15,9 @@ JOB FIELDS:
   steps     required — the commands in order, each {"cmd": ..., "args": [...]}:
               read_lef, read_def, read_db, read_liberty [-corner c], define_corners,
               create_clock <sources>, set_propagated_clock, set_layer_rc, set_wire_rc,
-              estimate_parasitics -placement [-spef_file F]
+              estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
+                picked as the reference does, placement here; unplaced is EST-0009, no
+                wire capacitance EST-0014)
   alpha     the Steiner builder's Prim-Dijkstra alpha (default 0.3)
   trace     write the RC state and one decision line per net to this path
 

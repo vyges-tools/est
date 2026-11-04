@@ -93,12 +93,17 @@ fn run(job: &Value) -> Result<Value, String> {
                 rc.set_wire_rc(&db, units(&lib)?, &args)?
             }
             "estimate_parasitics" => {
+                let tech = db.tech_get_name();
+                if args.iter().any(|a| a == "-global_routing") {
+                    return Err("estimate_parasitics -global_routing: not modelled".into());
+                }
+                // No flag (OpenROAD cf9e5840e36, in at 4155ac3): `designParasiticsSrc` picks the
+                // source, and an estimate it would not make is an error, not a warning.
                 if !args.iter().any(|a| a == "-placement") {
-                    return Err("estimate_parasitics without -placement: not modelled".into());
+                    design_parasitics_src(&db, &rc, &tech)?;
                 }
                 // check_corner_wire_caps (EST-0018): a corner with no signal wire capacitance, and
                 // nothing is estimated at all; estimateWireParasitics then also needs one resolved.
-                let tech = db.tech_get_name();
                 let zero: Vec<usize> = (0..rc.scenes.len()).filter(|&k| { let v = rc.resolved(&tech, k); (v[2] + v[3]) / 2.0 == 0.0 }).collect();
                 for &k in &zero {
                     let warning = format!(
@@ -162,6 +167,43 @@ fn run(job: &Value) -> Result<Value, String> {
                "spef_files": spef_files, "log": rc.log }))
 }
 
+/// `designParasiticsSrc` for `estimate_parasitics` with no flag, as far as a job can reach it:
+/// a job reads no SPEF and runs no router, so the source is placement unless the database holds
+/// global routes (`haveRoutes` loads them from the net guides), which is refused as the
+/// `-global_routing` path is. ⛔ In the reference's order: an unplaced design (EST-0009), then
+/// the routes, then a scene without signal wire capacitance (EST-0014, an ERROR here where
+/// `-placement` only warns EST-0018).
+fn design_parasitics_src(db: &Db, rc: &Rc, tech: &str) -> Result<(), String> {
+    if !design_is_placed(db) {
+        return Err("[ERROR EST-0009] The design is not placed: no parasitics to estimate.".into());
+    }
+    if db.net_names().iter().any(|n| db.num_net_get_guides(n) > 0) {
+        return Err("estimate_parasitics: the database holds global routes, so the source is global routing: not modelled".into());
+    }
+    for (k, scene) in rc.scenes.iter().enumerate() {
+        let v = rc.resolved(tech, k);
+        if (v[2] + v[3]) / 2.0 == 0.0 {
+            return Err(format!(
+                "[ERROR EST-0014] wire capacitance for corner {scene} is zero. Use the set_wire_rc command to set wire resistance and capacitance."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `GlobalRouter::designIsPlaced`: every port on a non-special net has its first pin placed, and
+/// every instance on a non-special net is placed.
+fn design_is_placed(db: &Db) -> bool {
+    let ports = db.bterm_names().into_iter().all(|bt| {
+        let net = db.bterm_get_net(&bt);
+        net.is_empty() || db.net_is_special(&net) || matches!(db.bterm_get_first_pin_placement_status(&bt).as_str(), "PLACED" | "FIRM" | "LOCKED" | "COVER")
+    });
+    ports
+        && db.net_names().into_iter().filter(|n| !db.net_is_special(n)).all(|n| {
+            db.net_iterms(&n).iter().all(|it| it.rsplit_once('/').is_none_or(|(inst, _)| db.inst_is_placed(inst)))
+        })
+}
+
 const USAGE: &str = "\
 vyges loom est — parasitic estimation: the RC network of every placed net, as SPEF
 
@@ -175,7 +217,9 @@ JOB FIELDS:
   steps     required — the commands in order, each {\"cmd\": ..., \"args\": [...]}:
               read_lef, read_def, read_db, read_liberty [-corner c], define_corners,
               create_clock <sources>, set_propagated_clock, set_layer_rc, set_wire_rc,
-              estimate_parasitics -placement [-spef_file F]
+              estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
+                picked as the reference does, placement here; unplaced is EST-0009, no
+                wire capacitance EST-0014)
   alpha     the Steiner builder's Prim-Dijkstra alpha (default 0.3)
   trace     write the RC state and one decision line per net to this path
 
@@ -222,7 +266,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of estimated, vacuous, refused or error. VACUOUS IS NOT ESTIMATED: no net was estimated, either because no estimate step ran or because every corner lacked signal wire capacitance (EST-0018, where the reference estimates nothing either). The declared assertion passes only on estimated. Exit status is 0 for estimated, 2 for vacuous and for error, 3 for refused.",
     "Correlated against the reference at pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad, 2026-10-12, comparing every SPEF byte for byte against a fresh reference run: 9 of 9 cases of the reference's own estimate_parasitics -placement tests with 0 differing lines, and 191 of 192 cases across the rest of its regression suite that call it, 22,484 nets exact; the one corpus case not scored fails while the reference prepares it. Earlier, at pin da9f29f18b6487825aa880597176e0fa97110b31, 2026-10-02, comparing every SPEF byte for byte against a fresh reference run: 9 of 9 cases of the reference's own estimate_parasitics -placement tests, and 185 of 186 cases across the rest of its regression suite that call it, 21,637 nets, 0 differing lines; the one corpus case not scored fails in the reference itself. The logic simulation that decides constant drivers matches the reference reading the same database pin for pin on every one of those designs. A NUMBER HERE MEANS NOTHING WITHOUT THE BUILD: the pin is part of the claim.",
-    "Only -placement is modelled. estimate_parasitics -global_routing is refused as a command; the library's global-route network (the wire module) is used by the router, not by this command.",
+    "Only the placement source is modelled: -placement, and estimate_parasitics with no flag, which picks the source as the reference does (placement for a job, which runs no router; a database holding global routes is refused) and raises the reference's errors for an unplaced design (EST-0009) and missing wire capacitance (EST-0014). estimate_parasitics -global_routing is refused as a command; the library's global-route network (the wire module) is used by the router, not by this command.",
     "REFUSED rather than approximated: liberty latch_bank groups; set_case_analysis, set_logic_*, set_disable_timing, create_generated_clock, set_sense and set_clock_sense, which change which pins are clocks without touching the database.",
     "Units, cell clock pins and constant outputs come from the FIRST liberty library read, as the timer's do. RC commands before any liberty read are refused: the timer's default units are not modelled. set_wire_rc checks its selectors before that, as the reference does: both -tech and -redistribution_layer (EST-0028) or an unknown -tech (EST-0030) is an error, and -redistribution_layer alone is refused (RDL chips are not modelled).",
     "Every value is single precision where the reference's is: Tcl doubles are narrowed to float at the command boundary, resistances and capacitances are summed as float, and SPEF values are printed as %g with six significant digits after a float division by the unit scale.",
@@ -395,7 +439,8 @@ pub fn main() -> ExitCode {
 mod descriptor_tests {
     //! ⛔ A descriptor that outlives the truth is the suite's recurring defect, and nothing fails
     //! when it does. These are the gate.
-    use super::{describe, exit_for, CRATE_PIN, DESCRIBE, PIN_TOKEN, USAGE};
+    use super::{describe, exit_for, run, CRATE_PIN, DESCRIBE, PIN_TOKEN, USAGE};
+    use serde_json::json;
 
     fn json() -> serde_json::Value {
         serde_json::from_str(DESCRIBE).expect("--describe must be valid JSON")
@@ -428,6 +473,50 @@ mod descriptor_tests {
         assert_eq!(v["openroad_pin"], CRATE_PIN);
         assert_eq!(CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
         assert_eq!(json()["openroad_pin"], PIN_TOKEN, "the FIELD must be the token in the source");
+    }
+
+    /// Rule (`designParasiticsSrc`, OpenROAD cf9e5840e36): `estimate_parasitics` with no flag on
+    /// an unplaced design is the error EST-0009; placed, with no wire capacitance, the error
+    /// EST-0014 (where `-placement` only warns EST-0018 and estimates nothing).
+    #[test]
+    fn a_flagless_estimate_errors_as_the_reference_picks_its_source() {
+        const LEF: &str = "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\n\
+            LAYER metal1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.2 ;\n  WIDTH 0.1 ;\nEND metal1\n\
+            SITE core\n  CLASS CORE ;\n  SIZE 0.2 BY 1.4 ;\nEND core\n\
+            MACRO BUF\n  CLASS CORE ;\n  ORIGIN 0 0 ;\n  SIZE 1 BY 1.4 ;\n  SITE core ;\n\
+            PIN A\n    DIRECTION INPUT ;\n    PORT\n      LAYER metal1 ;\n        RECT 0 0 0.1 0.1 ;\n    END\n  END A\n\
+            PIN Z\n    DIRECTION OUTPUT ;\n    PORT\n      LAYER metal1 ;\n        RECT 0.5 0 0.6 0.1 ;\n    END\n  END Z\nEND BUF\nEND LIBRARY\n";
+        let def = |status: &str| {
+            format!(
+                "VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\nDESIGN top ;\nUNITS DISTANCE MICRONS 1000 ;\n\
+                 DIEAREA ( 0 0 ) ( 10000 10000 ) ;\nCOMPONENTS 1 ;\n  - u1 BUF {status} ;\nEND COMPONENTS\n\
+                 PINS 1 ;\n  - in + NET in + DIRECTION INPUT + USE SIGNAL\n    + LAYER metal1 ( 0 0 ) ( 100 100 )\n    + PLACED ( 0 5000 ) N ;\nEND PINS\n\
+                 NETS 1 ;\n  - in ( PIN in ) ( u1 A ) ;\nEND NETS\nEND DESIGN\n"
+            )
+        };
+        let dir = std::env::temp_dir().join(format!("vyges-est-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lef = dir.join("t.lef");
+        std::fs::write(&lef, LEF).unwrap();
+        let reason = |status: &str, flag: Option<&str>| {
+            let d = dir.join(format!("{}.def", status.len()));
+            std::fs::write(&d, def(status)).unwrap();
+            let est: Vec<&str> = flag.into_iter().collect();
+            let job = json!({ "steps": [
+                { "cmd": "read_lef", "args": [lef.to_str().unwrap()] },
+                { "cmd": "read_def", "args": [d.to_str().unwrap()] },
+                { "cmd": "estimate_parasitics", "args": est },
+            ]});
+            run(&job)
+        };
+        let unplaced = reason("+ UNPLACED", None).unwrap_err();
+        assert!(unplaced.starts_with("[ERROR EST-0009]"), "{unplaced}");
+        let no_rc = reason("+ PLACED ( 1000 1000 ) N", None).unwrap_err();
+        assert!(no_rc.starts_with("[ERROR EST-0014] wire capacitance for corner default is zero."), "{no_rc}");
+        // `-placement` keeps its old behaviour: a warning, and nothing estimated
+        let warned = reason("+ PLACED ( 1000 1000 ) N", Some("-placement")).unwrap();
+        assert_eq!(warned["status"], "vacuous");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The assertion passes on the pass word, and ONLY the pass word exits 0.
