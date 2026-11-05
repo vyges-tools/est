@@ -52,9 +52,15 @@ fn run(job: &Value) -> Result<Value, String> {
         let u = lib.units.ok_or("RC before a liberty library: the timer's default units are not modelled")?;
         Ok(Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance })
     };
-    for step in job["steps"].as_array().ok_or("steps")? {
+    // Each step's outcome, when it has one to report: a query's value, or the error a `catch` step
+    // raised. A step marked `catch` (a case's `check_error`, `catch { … }`) that fails is recorded
+    // and the job goes on, as the script does; any other failing step ends the job.
+    let mut outcomes: Vec<Value> = Vec::new();
+    for (index, step) in job["steps"].as_array().ok_or("steps")?.iter().enumerate() {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let catch = step["catch"].as_bool().unwrap_or(false);
+        let outcome: Result<Option<String>, String> = (|| {
         match cmd {
             "read_lef" => {
                 let path = args.last().ok_or("read_lef path")?;
@@ -106,7 +112,7 @@ fn run(job: &Value) -> Result<Value, String> {
             }
             "set_clock_latency" => {
                 if args.iter().any(|a| a == "-source") {
-                    continue; // an insertion delay: propagation is unchanged
+                    return Ok(None); // an insertion delay: propagation is unchanged
                 }
                 let objects = clock_objects(&db, modes.cmd_clocks(), &args)?;
                 modes.cmd_clocks().set_clock_latency(&objects)?
@@ -138,7 +144,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     rc.log.push(warning);
                 }
                 if !zero.is_empty() || rc.resolve(&tech, |w| &w.signal_cap).is_empty() {
-                    continue;
+                    return Ok(None);
                 }
                 calls += 1;
                 rc.sort_clk_and_signal_layers();
@@ -184,6 +190,14 @@ fn run(job: &Value) -> Result<Value, String> {
             }
             other => return Err(format!("step {other}: not modelled")),
         }
+        Ok(None)
+        })();
+        match outcome {
+            Ok(Some(value)) => outcomes.push(json!({ "step": index, "value": value })),
+            Ok(None) => {}
+            Err(e) if catch => outcomes.push(json!({ "step": index, "error": e })),
+            Err(e) => return Err(e),
+        }
     }
     if let Some(path) = job["trace"].as_str() {
         std::fs::write(path, &trace_text).map_err(|e| format!("{path}: {e}"))?;
@@ -193,7 +207,7 @@ fn run(job: &Value) -> Result<Value, String> {
     // estimates nothing either — because the word asserts that work was done.
     let status = if estimated == 0 { "vacuous" } else { "estimated" };
     Ok(json!({ "tool": "vyges-est", "status": status, "estimates": calls, "nets": estimated,
-               "spef_files": spef_files, "log": rc.log }))
+               "spef_files": spef_files, "log": rc.log, "outcomes": outcomes }))
 }
 
 /// `designParasiticsSrc` for `estimate_parasitics` with no flag, as far as a job can reach it:
@@ -273,6 +287,8 @@ JOB FIELDS:
               estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
                 picked as the reference does, placement here; unplaced is EST-0009, no
                 wire capacitance EST-0014)
+            a step with \"catch\": true that fails is reported and the job goes on;
+            the report's `outcomes` holds each caught error
   alpha     the Steiner builder's Prim-Dijkstra alpha (default 0.3)
   trace     write the RC state and one decision line per net to this path
 
@@ -569,6 +585,57 @@ mod descriptor_tests {
         // `-placement` keeps its old behaviour: a warning, and nothing estimated
         let warned = reason("+ PLACED ( 1000 1000 ) N", Some("-placement")).unwrap();
         assert_eq!(warned["status"], "vacuous");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One placed buffer on one input net (Nangate-like units), and the steps that load it.
+    fn one_buffer(tag: &str) -> (std::path::PathBuf, Vec<serde_json::Value>) {
+        const LEF: &str = "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\n\
+            LAYER metal1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.2 ;\n  WIDTH 0.1 ;\nEND metal1\n\
+            SITE core\n  CLASS CORE ;\n  SIZE 0.2 BY 1.4 ;\nEND core\n\
+            MACRO BUF\n  CLASS CORE ;\n  ORIGIN 0 0 ;\n  SIZE 1 BY 1.4 ;\n  SITE core ;\n\
+            PIN A\n    DIRECTION INPUT ;\n    PORT\n      LAYER metal1 ;\n        RECT 0 0 0.1 0.1 ;\n    END\n  END A\n\
+            PIN Z\n    DIRECTION OUTPUT ;\n    PORT\n      LAYER metal1 ;\n        RECT 0.5 0 0.6 0.1 ;\n    END\n  END Z\nEND BUF\nEND LIBRARY\n";
+        const DEF: &str = "VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\nDESIGN top ;\nUNITS DISTANCE MICRONS 1000 ;\n\
+            DIEAREA ( 0 0 ) ( 10000 10000 ) ;\nCOMPONENTS 1 ;\n  - u1 BUF + PLACED ( 3000 1000 ) N ;\nEND COMPONENTS\n\
+            PINS 1 ;\n  - in + NET in + DIRECTION INPUT + USE SIGNAL\n    + LAYER metal1 ( 0 0 ) ( 100 100 )\n    + PLACED ( 0 5000 ) N ;\nEND PINS\n\
+            NETS 1 ;\n  - in ( PIN in ) ( u1 A ) ;\nEND NETS\nEND DESIGN\n";
+        const LIB: &str = r#"library (t) { capacitive_load_unit (1,ff); pulling_resistance_unit : "1kohm";
+            cell (BUF) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A";
+              timing () { related_pin : "A"; } } } }"#;
+        let dir = std::env::temp_dir().join(format!("vyges-est-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut steps = Vec::new();
+        for (name, text, cmd) in [("t.lef", LEF, "read_lef"), ("t.def", DEF, "read_def"), ("t.lib", LIB, "read_liberty")] {
+            std::fs::write(dir.join(name), text).unwrap();
+            steps.push(json!({ "cmd": cmd, "args": [dir.join(name).to_str().unwrap()] }));
+        }
+        (dir, steps)
+    }
+
+    /// The outcome a job reported for step `index`: its `value` or its `error`.
+    fn outcome(report: &serde_json::Value, index: usize, key: &str) -> String {
+        let all = report["outcomes"].as_array().expect("every report carries outcomes");
+        let o = all.iter().find(|o| o["step"] == index).unwrap_or_else(|| panic!("no outcome for step {index}: {report}"));
+        o[key].as_str().unwrap_or_else(|| panic!("step {index} has no {key}: {report}")).to_string()
+    }
+
+    /// Reference rule (the suite's `check_error`, test/helpers.tcl at the 4155ac3 pin): the error a
+    /// checked script raises is caught and the case goes on. A step marked `catch` that fails is
+    /// reported in `outcomes` and the job continues; any other failing step still ends the job.
+    #[test]
+    fn a_caught_step_is_reported_and_the_job_goes_on() {
+        let (dir, mut steps) = one_buffer("catch");
+        let spef = dir.join("after.spef").to_str().unwrap().to_string();
+        let uncaught = json!({ "steps": steps.clone().into_iter()
+            .chain([json!({ "cmd": "estimate_parasitics", "args": [] })]).collect::<Vec<_>>() });
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": [], "catch": true }));   // 3: EST-0014
+        steps.push(json!({ "cmd": "set_wire_rc", "args": ["-resistance", "0.0357", "-capacitance", "0.0752"] }));
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-spef_file", spef] }));
+        let r = run(&json!({ "steps": steps })).unwrap();
+        assert!(outcome(&r, 3, "error").contains("EST-0014"), "{r}");
+        assert!(std::path::Path::new(&spef).exists(), "the estimate after the caught error ran: {r}");
+        assert!(run(&uncaught).unwrap_err().contains("EST-0014"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

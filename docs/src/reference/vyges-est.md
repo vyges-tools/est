@@ -20,6 +20,8 @@ JOB FIELDS:
               estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
                 picked as the reference does, placement here; unplaced is EST-0009, no
                 wire capacitance EST-0014)
+            a step with "catch": true that fails is reported and the job goes on;
+            the report's `outcomes` holds each caught error
   alpha     the Steiner builder's Prim-Dijkstra alpha (default 0.3)
   trace     write the RC state and one decision line per net to this path
 
