@@ -56,6 +56,10 @@ fn run(job: &Value) -> Result<Value, String> {
     // raised. A step marked `catch` (a case's `check_error`, `catch { … }`) that fails is recorded
     // and the job goes on, as the script does; any other failing step ends the job.
     let mut outcomes: Vec<Value> = Vec::new();
+    // The parasitics' source (`EstimateParasitics::parasiticsSource`): SPEF once one is read, else
+    // the last estimate's (`parasitics_src_`), `none` before any.
+    let mut spef_read = false;
+    let mut source: &'static str = "none";
     for (index, step) in job["steps"].as_array().ok_or("steps")?.iter().enumerate() {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
@@ -117,6 +121,10 @@ fn run(job: &Value) -> Result<Value, String> {
                 let objects = clock_objects(&db, modes.cmd_clocks(), &args)?;
                 modes.cmd_clocks().set_clock_latency(&objects)?
             }
+            // `read_spef` (traced by `est::spef_read`, `spefRead`): the parasitics are now the file's;
+            // what the file holds is the timer's, not est's.
+            "read_spef" => spef_read = true,
+            "est::parasitics_source" => return Ok(Some(parasitics_source(spef_read, source).to_string())),
             "set_layer_rc" => rc.set_layer_rc(&mut db, units(&lib)?, &args)?,
             // The argument checks first: the reference raises them before converting any value.
             "set_wire_rc" => {
@@ -131,7 +139,10 @@ fn run(job: &Value) -> Result<Value, String> {
                 // No flag (OpenROAD cf9e5840e36, in at 4155ac3): `designParasiticsSrc` picks the
                 // source, and an estimate it would not make is an error, not a warning.
                 if !args.iter().any(|a| a == "-placement") {
-                    design_parasitics_src(&db, &rc, &tech)?;
+                    // `ensure_parasitics_cmd`: after a SPEF read the source is none, nothing estimated.
+                    if !design_parasitics_src(&db, &rc, &tech, spef_read)? {
+                        return Ok(None);
+                    }
                 }
                 // check_corner_wire_caps (EST-0018): a corner with no signal wire capacitance, and
                 // nothing is estimated at all; estimateWireParasitics then also needs one resolved.
@@ -143,7 +154,14 @@ fn run(job: &Value) -> Result<Value, String> {
                     );
                     rc.log.push(warning);
                 }
-                if !zero.is_empty() || rc.resolve(&tech, |w| &w.signal_cap).is_empty() {
+                if !zero.is_empty() {
+                    return Ok(None);
+                }
+                // `estimateParasitics(kPlacement)`: the SPEF is forgotten and the source set, even when
+                // `estimateWireParasitics` then finds no wire RC to estimate with.
+                spef_read = false;
+                source = "placement";
+                if rc.resolve(&tech, |w| &w.signal_cap).is_empty() {
                     return Ok(None);
                 }
                 calls += 1;
@@ -238,7 +256,11 @@ fn clock_objects(db: &Db, clocks: &Clocks, args: &[String]) -> Result<Vec<ClockO
     Ok(out)
 }
 
-fn design_parasitics_src(db: &Db, rc: &Rc, tech: &str) -> Result<(), String> {
+fn design_parasitics_src(db: &Db, rc: &Rc, tech: &str, spef_read: bool) -> Result<bool, String> {
+    // Parasitics read from a SPEF are not estimated over (`kNone`): checked before anything else.
+    if spef_read {
+        return Ok(false);
+    }
     if !design_is_placed(db) {
         return Err("[ERROR EST-0009] The design is not placed: no parasitics to estimate.".into());
     }
@@ -253,7 +275,13 @@ fn design_parasitics_src(db: &Db, rc: &Rc, tech: &str) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+/// `EstimateParasitics::parasiticsSource`: `spef` once a SPEF was read, else the last estimate's
+/// source.
+fn parasitics_source(spef_read: bool, source: &'static str) -> &'static str {
+    if spef_read { "spef" } else { source }
 }
 
 /// `GlobalRouter::designIsPlaced`: every port on a non-special net has its first pin placed, and
@@ -286,9 +314,11 @@ JOB FIELDS:
               get no network), set_layer_rc, set_wire_rc,
               estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
                 picked as the reference does, placement here; unplaced is EST-0009, no
-                wire capacitance EST-0014)
+                wire capacitance EST-0014, nothing after read_spef),
+              read_spef <file> (the parasitics become the file's), and the query
+              est::parasitics_source
             a step with \"catch\": true that fails is reported and the job goes on;
-            the report's `outcomes` holds each caught error
+            the report's `outcomes` holds each query's value and each caught error
   alpha     the Steiner builder's Prim-Dijkstra alpha (default 0.3)
   trace     write the RC state and one decision line per net to this path
 
@@ -639,6 +669,35 @@ mod descriptor_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Reference rules (`EstimateParasitics` at the 4155ac3 pin): `parasiticsSource` is `none`
+    /// before any estimate, the last estimate's source after one, and `spef` once `read_spef` ran
+    /// (`spefRead`, traced from `sta::read_spef`). A flagless estimate after a SPEF read estimates
+    /// nothing (`designParasiticsSrc` returns kNone before any other check), and any estimate that
+    /// runs forgets the SPEF (`estimateParasitics` clears `spef_read_`).
+    #[test]
+    fn a_read_spef_stops_the_flagless_estimate_until_an_explicit_one_runs() {
+        let (dir, mut steps) = one_buffer("spef");
+        let spef = |n: &str| dir.join(format!("{n}.spef")).to_str().unwrap().to_string();
+        let q = json!({ "cmd": "est::parasitics_source", "args": [] });
+        steps.push(q.clone());                                                                  // 3: none
+        steps.push(json!({ "cmd": "set_wire_rc", "args": ["-resistance", "0.0357", "-capacitance", "0.0752"] }));
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-spef_file", spef("auto")] }));
+        steps.push(q.clone());                                                                  // 6: placement
+        steps.push(json!({ "cmd": "read_spef", "args": [spef("auto")] }));
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-spef_file", spef("after_read")] }));
+        steps.push(q.clone());                                                                  // 9: spef
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-placement"] }));
+        steps.push(q);                                                                          // 11: placement
+        let r = run(&json!({ "steps": steps })).unwrap();
+        assert_eq!(outcome(&r, 3, "value"), "none");
+        assert_eq!(outcome(&r, 6, "value"), "placement");
+        assert!(std::path::Path::new(&spef("auto")).exists());
+        assert!(!std::path::Path::new(&spef("after_read")).exists(), "after read_spef the flagless estimate writes nothing");
+        assert_eq!(outcome(&r, 9, "value"), "spef");
+        assert_eq!(outcome(&r, 11, "value"), "placement", "an explicit estimate forgets the SPEF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Reference rule (OpenSTA `ClkNetwork::findClkPins` and `Sdc::setClockLatency` at the 4155ac3
     /// pin, read by `isSkipPin` when the estimate runs): the ideal clock pins are walked per clock,
     /// from the clocks that are not propagated. `set_propagated_clock [all_clocks]` then
@@ -728,7 +787,7 @@ mod descriptor_tests {
         for w in ["0  estimated", "2  vacuous", "2  error", "3  refused"] {
             assert!(USAGE.contains(w), "USAGE is missing `{w}`");
         }
-        for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "set_mode", "define_scene", "create_clock",
+        for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "set_mode", "define_scene", "read_spef", "est::parasitics_source", "create_clock",
                      "set_propagated_clock", "set_clock_latency", "set_layer_rc", "set_wire_rc", "estimate_parasitics"] {
             assert!(USAGE.contains(step), "USAGE does not name the `{step}` step");
             assert!(include_str!("main.rs").contains(&format!("\"{step}\" =>")), "`{step}` is not a step");
