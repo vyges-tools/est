@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,6 +338,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -447,7 +485,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vyges-est"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "flate2",
  "serde_json",
@@ -458,8 +496,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-events"
-version = "0.1.52"
-source = "git+https://github.com/vyges-tools/events?branch=main#00588a9d75a6fa07edf48fcdad3dfc76907c0e38"
+version = "0.1.53"
+source = "git+https://github.com/vyges-tools/events?branch=main#1fc532e533e9ad9232d42b541eff9718d03cd680"
 dependencies = [
  "serde",
  "serde_json",
@@ -467,13 +505,13 @@ dependencies = [
 
 [[package]]
 name = "vyges-geom"
-version = "0.1.52"
-source = "git+https://github.com/vyges-tools/geom?branch=main#d42b26b44dfb6c2d36967d91e285caaad38c813f"
+version = "0.1.53"
+source = "git+https://github.com/vyges-tools/geom?branch=main#e5322b4ef3bfbcfb80a940ea2ec19c863b6a01e4"
 
 [[package]]
 name = "vyges-layout"
-version = "0.1.52"
-source = "git+https://github.com/vyges-tools/layout?branch=main#d2a0b41275697c828388bfa9be06a65e923fa1f8"
+version = "0.1.53"
+source = "git+https://github.com/vyges-tools/layout?branch=main#43549927c1229d6a9c8d179943a23ec6970a6a1e"
 dependencies = [
  "miniz_oxide 0.8.9",
  "vyges-geom",
@@ -481,12 +519,16 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.52"
-source = "git+https://github.com/vyges-tools/loom.git?branch=main#9fb98ca2ecf2b40508074ef13dbab01f539436b6"
+version = "0.1.53"
+source = "git+https://github.com/vyges-tools/loom.git?branch=main#41583e1f406d9c5edf969c330df4a3b2bf0185c8"
+dependencies = [
+ "miniz_oxide 0.8.9",
+ "regex",
+]
 
 [[package]]
 name = "vyges-opendb"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "cxx",
  "miniz_oxide 0.8.9",
@@ -501,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-opendb-lib"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "cmake",
  "cxx",
@@ -510,8 +552,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-stt"
-version = "0.1.52"
-source = "git+https://github.com/vyges-tools/stt.git?branch=main#513330a1a9705da1851d6a30dbb68b16394d2fa9"
+version = "0.1.53"
+source = "git+https://github.com/vyges-tools/stt.git?branch=main#a9bc1b958ddd5a9b2aec2802c6a9ba6ae4728834"
 dependencies = [
  "serde_json",
  "vyges-events",
