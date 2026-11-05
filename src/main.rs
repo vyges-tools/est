@@ -125,6 +125,13 @@ fn run(job: &Value) -> Result<Value, String> {
             // what the file holds is the timer's, not est's.
             "read_spef" => spef_read = true,
             "est::parasitics_source" => return Ok(Some(parasitics_source(spef_read, source).to_string())),
+            // `grt::design_is_placed` (`GlobalRouter::designIsPlaced`), as `1` or `0`.
+            "grt::design_is_placed" => return Ok(Some(if design_is_placed(&db) { "1" } else { "0" }.to_string())),
+            // `[$block findInst I] setPlacementStatus S`: a case's own edit of the design.
+            "inst_set_placement_status" => {
+                let [inst, status] = args.as_slice() else { return Err("inst_set_placement_status needs an instance and a status".into()) };
+                db.inst_set_placement_status(inst, status).map_err(|e| format!("{inst}: {e}"))?
+            }
             "set_layer_rc" => rc.set_layer_rc(&mut db, units(&lib)?, &args)?,
             // The argument checks first: the reference raises them before converting any value.
             "set_wire_rc" => {
@@ -315,8 +322,9 @@ JOB FIELDS:
               estimate_parasitics [-placement] [-spef_file F] (no flag: the source is
                 picked as the reference does, placement here; unplaced is EST-0009, no
                 wire capacitance EST-0014, nothing after read_spef),
-              read_spef <file> (the parasitics become the file's), and the query
-              est::parasitics_source
+              read_spef <file> (the parasitics become the file's), the queries
+              est::parasitics_source and grt::design_is_placed, and
+              inst_set_placement_status <inst> <status>
             a step with \"catch\": true that fails is reported and the job goes on;
             the report's `outcomes` holds each query's value and each caught error
   alpha     the Steiner builder's Prim-Dijkstra alpha (default 0.3)
@@ -698,6 +706,25 @@ mod descriptor_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Reference rule (`GlobalRouter::designIsPlaced`, read by `grt::design_is_placed` and by
+    /// `designParasiticsSrc` at the 4155ac3 pin): an instance a case un-places with
+    /// `setPlacementStatus NONE` makes the design unplaced, and a flagless estimate then raises
+    /// EST-0009.
+    #[test]
+    fn an_instance_set_unplaced_makes_the_design_unplaced() {
+        let (dir, mut steps) = one_buffer("placed");
+        let q = json!({ "cmd": "grt::design_is_placed", "args": [] });
+        steps.push(q.clone());                                                                  // 3: 1
+        steps.push(json!({ "cmd": "inst_set_placement_status", "args": ["u1", "NONE"] }));
+        steps.push(q);                                                                          // 5: 0
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": [], "catch": true }));        // 6: EST-0009
+        let r = run(&json!({ "steps": steps })).unwrap();
+        assert_eq!(outcome(&r, 3, "value"), "1");
+        assert_eq!(outcome(&r, 5, "value"), "0");
+        assert!(outcome(&r, 6, "error").contains("EST-0009"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Reference rule (OpenSTA `ClkNetwork::findClkPins` and `Sdc::setClockLatency` at the 4155ac3
     /// pin, read by `isSkipPin` when the estimate runs): the ideal clock pins are walked per clock,
     /// from the clocks that are not propagated. `set_propagated_clock [all_clocks]` then
@@ -787,7 +814,8 @@ mod descriptor_tests {
         for w in ["0  estimated", "2  vacuous", "2  error", "3  refused"] {
             assert!(USAGE.contains(w), "USAGE is missing `{w}`");
         }
-        for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "set_mode", "define_scene", "read_spef", "est::parasitics_source", "create_clock",
+        for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "set_mode", "define_scene", "read_spef", "est::parasitics_source",
+                     "grt::design_is_placed", "inst_set_placement_status", "create_clock",
                      "set_propagated_clock", "set_clock_latency", "set_layer_rc", "set_wire_rc", "estimate_parasitics"] {
             assert!(USAGE.contains(step), "USAGE does not name the `{step}` step");
             assert!(include_str!("main.rs").contains(&format!("\"{step}\" =>")), "`{step}` is not a step");
