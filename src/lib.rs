@@ -11,6 +11,8 @@
 //! - [`clk_network`] (feature `odb`) — the timer's clock network (`findClkNets`).
 //! - [`placement`] (feature `odb`) — `estimate_parasitics -placement`: which nets get a network,
 //!   and each one's Steiner tree. ⬜ The network itself is not built yet.
+//! - [`modes`] (feature `odb`) — the timing modes and the scenes bound to them (`set_mode`,
+//!   `define_scene`).
 
 // The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
 // library too, and its `vyges_est::…` paths resolve here.
@@ -22,6 +24,7 @@ pub mod clk_network;
 pub mod sim;
 pub mod placement;
 pub mod rc;
+pub mod modes;
 pub mod network;
 pub mod spef;
 

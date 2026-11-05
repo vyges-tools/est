@@ -391,6 +391,11 @@ impl Clocks {
     pub fn network_read(&mut self) {
         self.network_built = true;
     }
+    /// The same clocks, in the same order and propagation, and the same propagated pins: two modes
+    /// that answer every clock question alike (whether their networks were read is not compared).
+    pub fn same_definitions(&self, other: &Clocks) -> bool {
+        self.clocks == other.clocks && self.propagated_pins == other.propagated_pins
+    }
     fn clock_mut(&mut self, name: &str) -> Result<&mut ClockDef, String> {
         self.clocks.iter_mut().find(|c| c.name == name).ok_or_else(|| format!("clock {name} not found"))
     }

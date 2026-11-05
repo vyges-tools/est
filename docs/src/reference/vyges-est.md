@@ -13,7 +13,7 @@ USAGE:
 
 JOB FIELDS:
   steps     required — the commands in order, each {"cmd": ..., "args": [...]}:
-              read_lef, read_def, read_db, read_liberty [-corner c], define_corners,
+              read_lef, read_def, read_db, read_liberty [-corner c], define_corners, set_mode, define_scene,
               create_clock [-name N] <sources>, set_propagated_clock <objects>,
               set_clock_latency <objects> (per clock and pin: an ideal clock's nets
               get no network), set_layer_rc, set_wire_rc,

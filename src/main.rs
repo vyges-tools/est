@@ -7,7 +7,7 @@
 //!
 //! The job: `steps`, the case's commands in order as `{cmd, args}` with the arguments as Tcl
 //! evaluated them (`read_lef`, `read_def`, `read_db`, `read_liberty [-corner c]`,
-//! `define_corners`, `create_clock [-name N] <sources>`, `set_propagated_clock <objects>`,
+//! `define_corners`, `set_mode <name>`, `define_scene <name> [-mode m]`, `create_clock [-name N] <sources>`, `set_propagated_clock <objects>`,
 //! `set_clock_latency <objects>`, `set_layer_rc`,
 //! `set_wire_rc`, `estimate_parasitics -placement [-spef_file F]`); `alpha` (the Steiner
 //! builder's, 0.3 by default) and `trace` (where to write the RC state and the per-net decisions,
@@ -17,6 +17,7 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 use vyges_est::liberty::LibertyClocks;
+use vyges_est::modes::Modes;
 use vyges_est::placement::{estimate_wire_parasitics_with_skips, skips_with_clocks, trace, Branch, ClockObject, Clocks, SttTree, Timing};
 use vyges_est::network::{self, NetCtx};
 use vyges_est::placement::Decision;
@@ -41,7 +42,7 @@ fn run(job: &Value) -> Result<Value, String> {
     let mut lib = LibertyClocks::default();
     let mut have_lib = false;
     let mut rc = Rc::new();
-    let mut clocks = Clocks::default();
+    let mut modes = Modes::default();
     let mut trace_text = String::new();
     let mut estimated = 0usize;
     let mut calls = 0usize;
@@ -84,7 +85,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 lib.read(&text)?;
                 have_lib = true;
             }
-            "define_corners" => rc.define_corners(&args),
+            "define_corners" => modes.define_corners(&mut rc, &args),
+            "define_scene" => modes.define_scene(&mut rc, &args)?,
+            "set_mode" => {
+                let [name] = args.as_slice() else { return Err("set_mode needs one mode name".into()) };
+                modes.set_cmd_mode(&rc, name)?
+            }
             // `-name N` first when the recorder knows it; without one the clock is named after
             // its first source, as the reference names it.
             "create_clock" => {
@@ -92,14 +98,18 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some("-name") => (args.get(1).cloned().ok_or("create_clock -name")?, args[2..].to_vec()),
                     _ => (args.first().cloned().unwrap_or_default(), args.clone()),
                 };
-                clocks.create_clock(&name, &sources);
+                modes.cmd_clocks().create_clock(&name, &sources);
             }
-            "set_propagated_clock" => clocks.set_propagated_clock(&clock_objects(&db, &clocks, &args)?)?,
+            "set_propagated_clock" => {
+                let objects = clock_objects(&db, modes.cmd_clocks(), &args)?;
+                modes.cmd_clocks().set_propagated_clock(&objects)?
+            }
             "set_clock_latency" => {
                 if args.iter().any(|a| a == "-source") {
                     continue; // an insertion delay: propagation is unchanged
                 }
-                clocks.set_clock_latency(&clock_objects(&db, &clocks, &args)?)?
+                let objects = clock_objects(&db, modes.cmd_clocks(), &args)?;
+                modes.cmd_clocks().set_clock_latency(&objects)?
             }
             "set_layer_rc" => rc.set_layer_rc(&mut db, units(&lib)?, &args)?,
             // The argument checks first: the reference raises them before converting any value.
@@ -133,10 +143,11 @@ fn run(job: &Value) -> Result<Value, String> {
                 calls += 1;
                 rc.sort_clk_and_signal_layers();
                 trace_text.push_str(&rc.trace(&tech));
+                let clocks = modes.estimate_clocks()?.clone();
                 let timing = Timing { liberty: have_lib.then_some(&lib), clock_sources: clocks.sources(), propagated: clocks.all_propagated() };
-                // ensureClkNetwork: the clock network is built from the SDC as it stands now.
+                // ensureClkNetwork, for every mode: the clock network is built from the SDC as it stands now.
                 let skips = skips_with_clocks(&db, &timing, &clocks)?;
-                clocks.network_read();
+                modes.network_read();
                 let nets = estimate_wire_parasitics_with_skips(&db, &timing, &skips, alpha, &stt)?;
                 estimated += nets.len();
                 trace_text.push_str(&trace(&nets));
@@ -255,7 +266,7 @@ USAGE:
 
 JOB FIELDS:
   steps     required — the commands in order, each {\"cmd\": ..., \"args\": [...]}:
-              read_lef, read_def, read_db, read_liberty [-corner c], define_corners,
+              read_lef, read_def, read_db, read_liberty [-corner c], define_corners, set_mode, define_scene,
               create_clock [-name N] <sources>, set_propagated_clock <objects>,
               set_clock_latency <objects> (per clock and pin: an ideal clock's nets
               get no network), set_layer_rc, set_wire_rc,
@@ -650,7 +661,7 @@ mod descriptor_tests {
         for w in ["0  estimated", "2  vacuous", "2  error", "3  refused"] {
             assert!(USAGE.contains(w), "USAGE is missing `{w}`");
         }
-        for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "create_clock",
+        for step in ["read_lef", "read_def", "read_db", "read_liberty", "define_corners", "set_mode", "define_scene", "create_clock",
                      "set_propagated_clock", "set_clock_latency", "set_layer_rc", "set_wire_rc", "estimate_parasitics"] {
             assert!(USAGE.contains(step), "USAGE does not name the `{step}` step");
             assert!(include_str!("main.rs").contains(&format!("\"{step}\" =>")), "`{step}` is not a step");
