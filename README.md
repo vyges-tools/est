@@ -1,7 +1,5 @@
 # vyges-est
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install loom`
-
 Parasitic estimation before detailed routing: the RC network of every net, built from its
 placement or from its global route, in the form a static timer reads.
 
