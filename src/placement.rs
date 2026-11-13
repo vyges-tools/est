@@ -292,7 +292,16 @@ pub fn skips_with_constants(db: &Db, timing: &Timing<'_>, values: &std::collecti
 
 /// [`skips`] with the clocks' propagation taken per clock and per pin, as the SDC left it.
 pub fn skips_with_clocks(db: &Db, timing: &Timing<'_>, clocks: &Clocks) -> Res<Skips> {
-    let mut s = skips(db, timing)?;
+    let empty = crate::liberty::LibertyClocks::default();
+    let values = crate::sim::constant_pins(db, timing.liberty.unwrap_or(&empty)).map_err(|e| e.to_string())?;
+    skips_with_clocks_and_constants(db, timing, clocks, &values)
+}
+
+/// [`skips_with_clocks`] from the constant pins the caller already holds — those of a logic
+/// simulation under the SDC's `set_case_analysis` / `set_logic_*` ([`crate::sim::constant_pins_constrained`]),
+/// which `isSkipPin` asks through `Sta::isConstant` like a tie cell's.
+pub fn skips_with_clocks_and_constants(db: &Db, timing: &Timing<'_>, clocks: &Clocks, values: &std::collections::BTreeMap<crate::sim::Pin, bool>) -> Res<Skips> {
+    let mut s = skips_with_constants(db, timing, values)?;
     s.ideal_clock_nets = match timing.liberty {
         Some(lib) if !timing.clock_sources.is_empty() => {
             crate::clk_network::find_ideal_clk_nets(db, lib, &timing.clock_sources, &clocks.ideal_sources(), &clocks.propagated_pins).map_err(|e| e.to_string())?
