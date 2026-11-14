@@ -67,6 +67,75 @@ pub struct Rc {
     pub layer_res: BTreeMap<i32, Vec<f64>>,
     pub layer_cap: BTreeMap<i32, Vec<f64>>,
     pub log: Vec<String>,
+    /// The technology's layers as native rows (see [`LayerTable`]), read once per database.
+    pub(crate) layer_table: LayerTableSlot,
+}
+
+/// One technology layer as the estimator walks it: `dbTechLayer::getNumber`, `getRoutingLevel`
+/// (0 for a non-routing layer) and whether `getType() == CUT`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LayerRow {
+    pub number: i32,
+    pub routing_level: i32,
+    pub is_cut: bool,
+}
+
+/// `dbTech`'s layer facts the per-pin paths read, in `getLayers()` order, so a walk over them is
+/// the reference's walk over `dbTechLayer*` (upstream pays a pointer dereference per layer; going
+/// through the name-keyed FFI per layer per pin is what this table avoids). It holds technology
+/// facts only — the per-corner resistances are read from `layer_res` on every call, as `layerRC`
+/// does — so it goes stale only when the technology itself changes: it is keyed by the database
+/// and its layer count and rebuilt when either differs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LayerTable {
+    key: (usize, i32),
+    pub rows: Vec<LayerRow>,
+    /// `getRoutingLayerCount()`.
+    pub routing_layer_count: i32,
+    /// `firstFrontsideRoutingLayer()->getRoutingLevel()`, `None` when there is none.
+    pub first_frontside_level: Option<i32>,
+}
+
+impl LayerTable {
+    fn key_of(db: &Db) -> (usize, i32) {
+        (db as *const Db as usize, db.tech_get_layer_count())
+    }
+
+    fn read(db: &Db) -> Res<LayerTable> {
+        let mut rows = Vec::new();
+        for name in db.tech_get_layers() {
+            let is_cut = db.layer_get_type(&name).map_err(|e| e.to_string())? == "CUT";
+            rows.push(LayerRow { number: db.layer_get_number(&name), routing_level: db.layer_get_routing_level(&name), is_cut });
+        }
+        let first = db.tech_first_frontside_routing_layer();
+        let first_frontside_level = if first.is_empty() { None } else { Some(db.layer_get_routing_level(&first)) };
+        Ok(LayerTable { key: Self::key_of(db), rows, routing_layer_count: db.tech_get_routing_layer_count(), first_frontside_level })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(rows: Vec<LayerRow>, routing_layer_count: i32, first_frontside_level: Option<i32>) -> LayerTable {
+        LayerTable { key: (0, 0), rows, routing_layer_count, first_frontside_level }
+    }
+
+    /// `findRoutingLayer(level)`: the first layer at that routing level.
+    pub fn by_routing_level(&self, level: i32) -> Option<&LayerRow> {
+        self.rows.iter().find(|r| r.routing_level == level)
+    }
+
+    /// The layer with that number, if the technology has one.
+    pub fn by_number(&self, number: i32) -> Option<&LayerRow> {
+        self.rows.iter().find(|r| r.number == number)
+    }
+}
+
+/// Holder for the [`LayerTable`]; a clone starts empty and re-reads on first use.
+#[derive(Debug, Default)]
+pub(crate) struct LayerTableSlot(std::sync::Mutex<Option<std::sync::Arc<LayerTable>>>);
+
+impl Clone for LayerTableSlot {
+    fn clone(&self) -> Self {
+        LayerTableSlot::default()
+    }
 }
 
 /// A value through a `float` parameter.
@@ -101,6 +170,20 @@ fn num(s: &str) -> Res<f64> {
 impl Rc {
     pub fn new() -> Rc {
         Rc { scenes: vec!["default".to_string()], ..Default::default() }
+    }
+
+    /// The technology's [`LayerTable`] for `db`, read on first use and whenever the database or its
+    /// layer count changed since.
+    pub(crate) fn layer_table(&self, db: &Db) -> Res<std::sync::Arc<LayerTable>> {
+        let mut slot = self.layer_table.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = slot.as_ref() {
+            if t.key == LayerTable::key_of(db) {
+                return Ok(t.clone());
+            }
+        }
+        let t = std::sync::Arc::new(LayerTable::read(db)?);
+        *slot = Some(t.clone());
+        Ok(t)
     }
 
     /// `define_corners` — replaces the corners.

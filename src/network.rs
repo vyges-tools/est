@@ -226,9 +226,14 @@ fn insert_via_resistances(cx: &NetCtx<'_>, g: &mut Parasitic, p: i32, t: i32, pi
         let (start, end) = (p.min(t), p.max(t));
         let pin_is_below = p < t;
         let mut prev: Option<Node> = None;
+        let table = cx.rc.layer_table(cx.db)?;
         for l in start..end {
-            let name = cx.db.layer_name_by_number(i64::from(l));
-            if cx.db.layer_get_type(&name).map_err(|e| e.to_string())? != "CUT" {
+            let is_cut = match table.by_number(l) {
+                Some(row) => row.is_cut,
+                // Not a technology layer: the lookup by number fails as it always has.
+                None => cx.db.layer_get_type(&cx.db.layer_name_by_number(i64::from(l))).map_err(|e| e.to_string())? == "CUT",
+            };
+            if !is_cut {
                 continue;
             }
             let cut_res = cut_rc(l).max(1.0e-3);
@@ -279,27 +284,28 @@ fn compute_average_cut_resistance(cx: &NetCtx<'_>) -> Res<f64> {
     if cx.rc.layer_res.is_empty() {
         return Ok(0.0);
     }
-    let db = cx.db;
-    let (min, mut max) = (db.block_get_min_routing_layer(), db.block_get_max_routing_layer());
+    let table = cx.rc.layer_table(cx.db)?;
+    let (min, max) = (cx.db.block_get_min_routing_layer(), cx.db.block_get_max_routing_layer());
+    average_cut_resistance(&table, min, max, |number| cx.rc.layer_rc(number, cx.corner).0)
+}
+
+/// The walk of `computeAverageCutResistance` over the technology's layers: `res` is `layerRC`'s
+/// resistance for a layer number at the call's corner.
+fn average_cut_resistance(table: &crate::rc::LayerTable, min: i32, mut max: i32, res: impl Fn(i32) -> f64) -> Res<f64> {
     if max < 0 {
-        let total = db.tech_get_routing_layer_count();
-        let first_front = db.tech_first_frontside_routing_layer();
-        max = if first_front.is_empty() {
-            total / 2
-        } else {
-            let first_level = db.layer_get_routing_level(&first_front);
-            first_level - 1 + (total - first_level + 1) / 2
+        let total = table.routing_layer_count;
+        max = match table.first_frontside_level {
+            None => total / 2,
+            Some(first_level) => first_level - 1 + (total - first_level + 1) / 2,
         };
     }
-    let by_level = |lvl: i32| db.tech_get_layers().into_iter().find(|l| db.layer_get_routing_level(l) == lvl);
-    let (lo, hi) = (by_level(min).ok_or("min routing layer")?, by_level(max).ok_or("max routing layer")?);
+    let lo = table.by_routing_level(min).ok_or("min routing layer")?.number;
+    let hi = table.by_routing_level(max).ok_or("max routing layer")?.number;
     let (mut total, mut count) = (0.0f64, 0);
-    for n in db.layer_get_number(&lo)..=db.layer_get_number(&hi) {
-        let name = db.layer_name_by_number(i64::from(n));
-        if !name.is_empty() && db.layer_get_type(&name).map_err(|e| e.to_string())? == "CUT" {
-            total += cx.rc.layer_rc(n, cx.corner).0;
-            count += 1;
-        }
+    // `for (layer : tech->getLayers())`: numbers in [min, max], CUT only, in getLayers order.
+    for row in table.rows.iter().filter(|r| r.number >= lo && r.number <= hi && r.is_cut) {
+        total += res(row.number);
+        count += 1;
     }
     Ok(if count > 0 { total / f64::from(count) } else { 0.0 })
 }
@@ -310,4 +316,45 @@ pub fn make_pad_parasitic(db: &Db, pins: &[PinLoc]) -> Res<Parasitic> {
     let (a, b) = (ensure_pin(db, &mut g, &pins[0])?, ensure_pin(db, &mut g, &pins[1])?);
     g.make_resistor(a, b, 0.001);
     Ok(g)
+}
+
+#[cfg(test)]
+mod average_cut_resistance_tests {
+    use super::*;
+    use crate::rc::{LayerRow, LayerTable};
+
+    /// M1 V1 M2 V2 M3 V3 M4, numbers 1..=7, routing levels 1..=4 on the metals.
+    fn stack(first_frontside_level: Option<i32>) -> LayerTable {
+        let rows = (1..=7).map(|n| LayerRow { number: n, routing_level: if n % 2 == 1 { (n + 1) / 2 } else { 0 }, is_cut: n % 2 == 0 }).collect();
+        LayerTable::for_test(rows, 4, first_frontside_level)
+    }
+
+    /// Upstream `computeAverageCutResistance`: the mean `layerRC` resistance of the CUT layers whose
+    /// numbers lie between the min and max routing layers' numbers, inclusive.
+    #[test]
+    fn the_mean_covers_only_the_cuts_between_min_and_max() {
+        let t = stack(Some(1));
+        // Non-linear in the number, so a mean over metals too, or over a shifted range, differs.
+        let res = |n: i32| f64::from(n * n);
+        assert_eq!(average_cut_resistance(&t, 1, 2, res).unwrap(), 4.0);
+        assert_eq!(average_cut_resistance(&t, 1, 4, res).unwrap(), (4.0 + 16.0 + 36.0) / 3.0);
+        assert_eq!(average_cut_resistance(&t, 2, 3, res).unwrap(), 16.0);
+    }
+
+    /// Upstream: with no max routing layer (`< 0`) it takes `first_level - 1 + (levels -
+    /// first_level + 1) / 2` from the first frontside level, else `levels / 2`.
+    #[test]
+    fn an_unset_max_takes_the_middle_of_the_frontside_stack() {
+        let res = |n: i32| f64::from(n * n);
+        // levels 4, first frontside level 3: 2 + (4 - 3 + 1) / 2 = 3 -> cuts 2, 4 from level 1.
+        assert_eq!(average_cut_resistance(&stack(Some(3)), 1, -1, res).unwrap(), 10.0);
+        // no frontside layer: 4 / 2 = 2 -> cut 2 only.
+        assert_eq!(average_cut_resistance(&stack(None), 1, -1, res).unwrap(), 4.0);
+    }
+
+    /// A min or max level no layer has is an error, as `findRoutingLayer` returning null would be.
+    #[test]
+    fn a_missing_routing_level_is_an_error() {
+        assert!(average_cut_resistance(&stack(Some(1)), 1, 9, |_| 1.0).is_err());
+    }
 }
