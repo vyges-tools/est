@@ -134,7 +134,7 @@ impl LayerRC {
 }
 
 /// A node of the network: the pin it is, or the routing point it sits on.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeId {
     /// `ensureParasiticNode(parasitic, pin, network)` — named after the pin.
     Pin(String),
@@ -144,7 +144,7 @@ pub enum NodeId {
 }
 
 /// The network as the builder leaves it.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Network {
     /// Ground capacitance per node, in the order the nodes were created.
     pub nodes: Vec<(NodeId, f32)>,
@@ -153,14 +153,32 @@ pub struct Network {
     /// What the reference warns about and skips: a pin with no grid node (EST-26/EST-350), a
     /// segment that is neither wire nor via (EST-25).
     pub warnings: Vec<String>,
+    /// Where each node sits in `nodes`, while the network is being built: the reference finds a
+    /// node through maps (`ConcreteParasiticNetwork::sub_nodes_`, `pin_nodes_`), not a scan. It
+    /// orders nothing (`nodes` keeps creation order) and is dropped when the build ends, so a
+    /// finished network holds no second copy of its node ids.
+    index: std::collections::HashMap<NodeId, usize>,
+}
+
+/// Equal networks: the same nodes, resistors and warnings (the build-time index is derived).
+impl PartialEq for Network {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && self.resistors == other.resistors && self.warnings == other.warnings
+    }
 }
 
 impl Network {
+    /// `ensureParasiticNode`: the node's index, made (with no capacitance) on first sight.
     fn node_index(&mut self, id: &NodeId) -> usize {
-        if let Some(i) = self.nodes.iter().position(|(n, _)| n == id) {
+        if self.index.len() != self.nodes.len() {
+            // a network whose index was dropped (or never built): rebuild it from `nodes`
+            self.index = self.nodes.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
+        }
+        if let Some(&i) = self.index.get(id) {
             return i;
         }
         self.nodes.push((id.clone(), 0.0));
+        self.index.insert(id.clone(), self.nodes.len() - 1);
         self.nodes.len() - 1
     }
     /// `incrCap(node, cap)` — ⚠️ the sum is kept in `float`.
@@ -230,6 +248,7 @@ pub fn estimate_net(net: &NetParasitics<'_>, rc: &LayerRC) -> Network {
     for pin in net.pins {
         make_partial_parasitics_to_pin(net, pin, rc, &centers, &mut g, &mut map);
     }
+    g.index = std::collections::HashMap::new();
     g
 }
 
@@ -374,6 +393,30 @@ mod tests {
 
     fn seg(x0: i32, y0: i32, l0: i32, x1: i32, y1: i32, l1: i32) -> Segment {
         Segment { init_x: x0, init_y: y0, init_layer: l0, final_x: x1, final_y: y1, final_layer: l1 }
+    }
+
+    // Rule (`ConcreteParasiticNetwork::ensureParasiticNode`: a node is found in the network's
+    // map and made only when absent): each id is ONE node, in first-seen order, whatever the
+    // lookup's container, and a node met again accumulates its capacitance. Also: a finished
+    // network (its index dropped) extended again finds its existing nodes.
+    #[test]
+    fn a_node_is_made_once_in_first_seen_order_and_found_again() {
+        let mut g = Network::default();
+        let ids: Vec<NodeId> = (0..300).map(|k| if k % 3 == 0 { NodeId::Pin(format!("i{k}/A")) } else { NodeId::Point(k) }).collect();
+        for round in 0..2 {
+            for id in &ids {
+                // made by the first call, found by the second (through the index, while building)
+                g.incr_cap(id, 0.5);
+                g.incr_cap(id, 0.5);
+            }
+            if round == 0 {
+                g.index = std::collections::HashMap::new();
+            }
+        }
+        g.make_resistor(&ids[7], &NodeId::Point(9999), 1.0);
+        let want: Vec<(NodeId, f32)> = ids.iter().map(|id| (id.clone(), 2.0)).chain([(NodeId::Point(9999), 0.0)]).collect();
+        assert_eq!(g.nodes, want);
+        assert_eq!(g.resistors, vec![(ids[7].clone(), NodeId::Point(9999), 1.0)]);
     }
 
     // A wire's capacitance is split half to each end; its resistor joins the two point nodes.
