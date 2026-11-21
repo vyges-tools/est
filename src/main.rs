@@ -97,6 +97,7 @@ fn run(job: &Value) -> Result<Value, String> {
             }
             "define_corners" => modes.define_corners(&mut rc, &args),
             "define_scene" => modes.define_scene(&mut rc, &args)?,
+            "set_scene" => modes.set_scene(&rc, args.first().ok_or("set_scene needs a name")?)?,
             "set_mode" => {
                 let [name] = args.as_slice() else { return Err("set_mode needs one mode name".into()) };
                 modes.set_cmd_mode(&rc, name)?

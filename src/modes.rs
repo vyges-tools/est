@@ -103,6 +103,16 @@ impl Modes {
         Ok(())
     }
 
+    /// `set_scene name` (`Sta::setCmdScene`): the command scene, and with it the command mode
+    /// becomes that scene's mode; an unknown scene is STA-0578.
+    pub fn set_scene(&mut self, rc: &Rc, name: &str) -> Result<(), String> {
+        let k = rc.scenes.iter().position(|n| n == name).ok_or_else(|| format!("[ERROR STA-0578] {name} is not the name of a scene."))?;
+        if let Some(&m) = self.scene_modes.get(k) {
+            self.cmd = m;
+        }
+        Ok(())
+    }
+
     /// `define_corners`: the scenes it makes are bound to the command mode.
     pub fn define_corners(&mut self, rc: &mut Rc, names: &[String]) {
         rc.define_corners(names);
@@ -168,6 +178,21 @@ mod tests {
         assert_eq!(m.scene_mode_names(), vec!["func", "test"], "no -mode: the command mode");
         let e = m.define_scene(&mut rc, &s(&["x", "-mode", "nope", "-liberty", "lib"])).unwrap_err();
         assert!(e.contains("STA-1572"), "{e}");
+    }
+
+    /// `set_scene` (OpenSTA at the f11b4276 pin, `setCmdScene`): the command mode follows the
+    /// scene's mode, so a later `define_scene` without `-mode` binds that mode; STA-0578 otherwise.
+    #[test]
+    fn set_scene_makes_the_scene_mode_the_command_mode() {
+        let mut rc = Rc::new();
+        let mut m = Modes::default();
+        m.set_cmd_mode(&rc, "func").unwrap();
+        m.set_cmd_mode(&rc, "test").unwrap();
+        m.define_scene(&mut rc, &s(&["a", "-mode", "func", "-liberty", "lib"])).unwrap();
+        m.set_scene(&rc, "a").unwrap();
+        m.define_scene(&mut rc, &s(&["b", "-liberty", "lib"])).unwrap();
+        assert_eq!(m.scene_mode_names(), vec!["func", "func"]);
+        assert!(m.set_scene(&rc, "c").unwrap_err().contains("STA-0578"));
     }
 
     /// The estimate reads one clock answer only when every mode holds the same clocks.
