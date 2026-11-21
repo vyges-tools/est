@@ -149,12 +149,12 @@ fn by_id(mut keyed: Vec<(u64, PinLoc)>) -> Vec<PinLoc> {
 /// `dbNetwork::drivers(net)` — ⛔ NOT OpenSTA's visitor over every driver: `dbNetwork` overrides it
 /// with odb's `dbNet::getFirstDriverTerm`, so a net has AT MOST ONE driver here (`report_net`,
 /// which walks the generic visitor, can list two — `make_parasitics4`'s `in1`: the input port and a
-/// bidirect pad pin — while `est` sees only the pad pin).
+/// bidirect pad pin — while `est` sees only one: the pad pin at `4155ac31`, the port from `f11b4276`).
 ///
-/// `getFirstDriverTerm`: none on a supply net; else the first instance terminal (net order) that is
-/// not supply, not clocked (`isClocked`: a CLOCK master terminal or the terminal's flag) and whose
-/// LEF IO type is OUTPUT or INOUT; else the first block terminal, not supply, INPUT or INOUT. The
-/// LEF types, not liberty's.
+/// `getFirstDriverTerm`: none on a supply net; else the first BLOCK terminal (net order) that is not
+/// supply and is INPUT or INOUT; else the first instance terminal, not supply, not clocked
+/// (`isClocked`: a CLOCK master terminal or the terminal's flag) and whose LEF IO type is OUTPUT or
+/// INOUT. The LEF types, not liberty's. The walk itself is [`first_driver_of`].
 ///
 /// ⚠️ The `isClocked` exclusion is UNWITNESSED: dropping it changes no corpus case — no net there
 /// has a clocked terminal that is also an output or inout.
@@ -163,15 +163,29 @@ fn first_driver_term<'a>(db: &Db, net: &str, pins: &'a [PinLoc]) -> Option<&'a P
     if supply(&db.net_sigtype(net)) {
         return None;
     }
-    let iterm = pins.iter().filter(|p| !p.is_port).find(|p| {
-        let (inst, term) = p.name.rsplit_once('/').unwrap_or((&p.name, ""));
-        !supply(&db.iterm_get_sig_type(inst, term))
-            && !db.iterm_is_clocked(inst, term)
-            && matches!(db.iterm_get_io_type(inst, term).as_str(), "OUTPUT" | "INOUT")
-    });
-    iterm.or_else(|| {
-        pins.iter().filter(|p| p.is_port).find(|p| !supply(&db.bterm_get_sig_type(&p.name)) && matches!(db.bterm_get_io_type(&p.name).as_str(), "INPUT" | "INOUT"))
-    })
+    first_driver_of(
+        pins,
+        |p| !supply(&db.bterm_get_sig_type(&p.name)) && matches!(db.bterm_get_io_type(&p.name).as_str(), "INPUT" | "INOUT"),
+        |p| {
+            let (inst, term) = p.name.rsplit_once('/').unwrap_or((&p.name, ""));
+            !supply(&db.iterm_get_sig_type(inst, term))
+                && !db.iterm_is_clocked(inst, term)
+                && matches!(db.iterm_get_io_type(inst, term).as_str(), "OUTPUT" | "INOUT")
+        },
+    )
+}
+
+/// The order `dbNet::getFirstDriverTerm` walks a (non-supply) net's terminals: every block terminal
+/// first, then every instance terminal, each in the database's list order; the first one its
+/// predicate accepts is the driver.
+///
+/// 🔑 Block terminals FIRST since the `f11b4276` pin (odb `2a3442396f`, 2026-10-22, a speed-up for
+/// high-fanout nets); at `4155ac31` and before, instance terminals came first. A net with BOTH an
+/// accepted port and an accepted instance terminal (an input port beside a bidirect pad pin)
+/// changes driver with the pin.
+fn first_driver_of<'a>(pins: &'a [PinLoc], bterm_drives: impl Fn(&PinLoc) -> bool, iterm_drives: impl Fn(&PinLoc) -> bool) -> Option<&'a PinLoc> {
+    let bterm = pins.iter().filter(|p| p.is_port).find(|p| bterm_drives(p));
+    bterm.or_else(|| pins.iter().filter(|p| !p.is_port).find(|p| iterm_drives(p)))
 }
 
 /// `isPadNet`: the net's FIRST TWO connected pins (`net2Pins`) are a top-level port and a pad pin —
@@ -217,7 +231,7 @@ struct Work {
 /// The work list, every `dbNet` in block order with its first driver.
 fn find_work(db: &Db) -> Res<Vec<Work>> {
     db.net_names().into_iter().map(|net| {
-        // getFirstDriverTerm walks the database's lists: instance terminals, then block terminals.
+        // getFirstDriverTerm walks the database's lists: block terminals, then instance terminals.
         let keyed = connected_pins_keyed(db, &net)?;
         let db_order: Vec<PinLoc> = keyed.iter().map(|(_, p)| p.clone()).collect();
         let drvr = first_driver_term(db, &net, &db_order).cloned();
@@ -581,6 +595,24 @@ mod tests {
         assert!(c.propagated_pins.is_empty());
         assert_eq!(c.ideal_sources(), ["pb"], "a pin latency leaves the clock propagated");
         assert!(c.set_propagated_clock(&[ClockObject::Clock("nope".into())]).is_err());
+    }
+
+    fn pin(name: &str, is_port: bool) -> PinLoc {
+        PinLoc { name: name.into(), is_port, x: 0, y: 0, placed: true }
+    }
+
+    /// Reference rule (odb `dbNet::getFirstDriverTerm` at the f11b4276 pin, `2a3442396f`): block
+    /// terminals are scanned BEFORE instance terminals, each in list order; at 4155ac31 instance
+    /// terminals came first. Witness: an input port beside a bidirect pad pin (`make_parasitics4`'s
+    /// `in1`) is driven by the port now.
+    #[test]
+    fn a_port_drives_before_an_instance_terminal() {
+        let pins = [pin("pad/PAD", false), pin("u1/Z", false), pin("in1", true), pin("in2", true)];
+        let every = |_: &PinLoc| true;
+        assert_eq!(first_driver_of(&pins, every, every).unwrap().name, "in1", "the first accepted port wins over earlier instance terminals");
+        assert_eq!(first_driver_of(&pins, |p| p.name == "in2", every).unwrap().name, "in2", "ports in list order, the first ACCEPTED");
+        assert_eq!(first_driver_of(&pins, |_| false, |p| p.name == "u1/Z").unwrap().name, "u1/Z", "no accepted port: the first accepted instance terminal");
+        assert!(first_driver_of(&pins, |_| false, |_| false).is_none());
     }
 
     /// Reference rule (estimateWireParasitics at the 4155ac3 pin): the work list, every net with
