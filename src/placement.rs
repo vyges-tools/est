@@ -183,7 +183,7 @@ fn first_driver_term<'a>(db: &Db, net: &str, pins: &'a [PinLoc]) -> Option<&'a P
 /// high-fanout nets); at `4155ac31` and before, instance terminals came first. A net with BOTH an
 /// accepted port and an accepted instance terminal (an input port beside a bidirect pad pin)
 /// changes driver with the pin.
-fn first_driver_of<'a>(pins: &'a [PinLoc], bterm_drives: impl Fn(&PinLoc) -> bool, iterm_drives: impl Fn(&PinLoc) -> bool) -> Option<&'a PinLoc> {
+fn first_driver_of(pins: &[PinLoc], bterm_drives: impl Fn(&PinLoc) -> bool, iterm_drives: impl Fn(&PinLoc) -> bool) -> Option<&PinLoc> {
     let bterm = pins.iter().filter(|p| p.is_port).find(|p| bterm_drives(p));
     bterm.or_else(|| pins.iter().filter(|p| !p.is_port).find(|p| iterm_drives(p)))
 }
