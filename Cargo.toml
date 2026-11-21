@@ -19,7 +19,7 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-events", "dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "repin-f11b4276", optional = true }
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
