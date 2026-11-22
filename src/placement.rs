@@ -254,7 +254,7 @@ fn estimate_work(db: &Db, timing: &Timing<'_>, skips: &Skips, w: Work, alpha: f3
 /// Both are whole-design walks. A caller estimating one net at a time across many edits (a repair
 /// loop) can hold them with [`skips`] and [`estimate_net_with_skips`], and must compute them again
 /// after any edit that could change them: one that touches a clock net or a net with a constant pin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Skips {
     clock_nets: BTreeSet<String>,
     /// The nets of the ideal clock pins: the ones `isSkipPin` skips.
@@ -287,10 +287,7 @@ pub fn skips(db: &Db, timing: &Timing<'_>) -> Res<Skips> {
 /// [`skips`] from the constant pins the caller already holds (`crate::sim::constant_pins` on the
 /// design as it is now, with the same library): the logic simulation is not run again.
 pub fn skips_with_constants(db: &Db, timing: &Timing<'_>, values: &std::collections::BTreeMap<crate::sim::Pin, bool>) -> Res<Skips> {
-    let clock_nets = match timing.liberty {
-        Some(lib) if !timing.clock_sources.is_empty() => crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?,
-        _ => BTreeSet::new(),
-    };
+    let clock_nets = clock_nets_now(db, timing)?;
     // STAGE DUMP — every constant pin and its value, to diff against the reference's
     // `sta::pin_sim_logic_value` over the same design.
     if let Some(path) = std::env::var_os("EST_SIM_DUMP") {
@@ -299,9 +296,37 @@ pub fn skips_with_constants(db: &Db, timing: &Timing<'_>, values: &std::collecti
         std::fs::write(path, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
     }
     let constants = values.keys().map(|p| p.path_name()).collect();
-    // One flag for every clock: all of them ideal, or none.
-    let ideal_clock_nets = if timing.propagated { BTreeSet::new() } else { clock_nets.clone() };
-    Ok(Skips { clock_nets, ideal_clock_nets, constants })
+    Ok(Skips::from_parts(clock_nets, constants, timing))
+}
+
+/// The clock network's nets on the design as it is now (`ClkNetwork::findClkPins` from the
+/// clock sources), none without a library or a clock.
+fn clock_nets_now(db: &Db, timing: &Timing<'_>) -> Res<BTreeSet<String>> {
+    Ok(match timing.liberty {
+        Some(lib) if !timing.clock_sources.is_empty() => crate::clk_network::find_clk_nets(db, lib, &timing.clock_sources).map_err(|e| e.to_string())?,
+        _ => BTreeSet::new(),
+    })
+}
+
+impl Skips {
+    fn from_parts(clock_nets: BTreeSet<String>, constants: BTreeSet<String>, timing: &Timing<'_>) -> Skips {
+        // One flag for every clock: all of them ideal, or none.
+        let ideal_clock_nets = if timing.propagated { BTreeSet::new() } else { clock_nets.clone() };
+        Skips { clock_nets, ideal_clock_nets, constants }
+    }
+
+    /// These skips after an edit that changed the clock network but no pin's logic value: the
+    /// same constant pins, the clock network walked again on the design as it is now — what
+    /// [`skips_with_constants`] gives from the same constants, without the logic simulation.
+    /// For skips made by [`skips`] / [`skips_with_constants`] (one propagation flag for every clock).
+    ///
+    /// Rule (OpenSTA: a netlist edit invalidates `ClkNetwork`, which `findClkPins` rebuilds from
+    /// the clock sources; `Sim` re-evaluates only the instances whose input values changed, so an
+    /// edit that keeps every pin's value — a buffer inserted on, or removed from, a non-constant
+    /// net — leaves the constants as they were).
+    pub fn with_clock_network_now(self, db: &Db, timing: &Timing<'_>) -> Res<Skips> {
+        Ok(Skips::from_parts(clock_nets_now(db, timing)?, self.constants, timing))
+    }
 }
 
 /// [`skips`] with the clocks' propagation taken per clock and per pin, as the SDC left it.
