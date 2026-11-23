@@ -18,7 +18,7 @@
 
 #![cfg(feature = "odb")]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use vyges_opendb::Db;
 
 use crate::liberty::{eval_constant, Expr, LibertyClocks};
@@ -42,92 +42,307 @@ impl Pin {
     }
 }
 
+
+/// A pin's direction as the network reads it: `Network::isDriver` / `isLoad` ask only whether it
+/// is an input (or bidirect) and whether an output (or bidirect). A pin no net reads is neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Dir {
+    input: bool,
+    output: bool,
+}
+
+impl Dir {
+    fn of(io: &str) -> Dir {
+        Dir { input: matches!(io, "INPUT" | "INOUT"), output: matches!(io, "OUTPUT" | "INOUT") }
+    }
+}
+
+const NO_NET: u32 = u32::MAX;
+
+/// What [`Network::read`] asks of the design — the `Db` accessors it calls, by name. A test
+/// builds a network from a hand-written design through the same read.
+trait Source {
+    fn inst_names(&self) -> Vec<String>;
+    fn inst_master(&self, inst: &str) -> String;
+    /// Every terminal of a master in the master's order, with its signal type.
+    fn master_terms(&self, master: &str) -> Vec<(String, String)>;
+    fn mterm_io(&self, master: &str, term: &str) -> String;
+    fn net_names(&self) -> Vec<String>;
+    fn net_sigtype(&self, net: &str) -> String;
+    fn net_is_special(&self, net: &str) -> bool;
+    fn net_bterms(&self, net: &str) -> Vec<String>;
+    fn bterm_sig(&self, bterm: &str) -> String;
+    fn bterm_io(&self, bterm: &str) -> String;
+    /// `inst/term` per instance terminal of the net.
+    fn net_iterms(&self, net: &str) -> Vec<String>;
+}
+
+impl Source for Db {
+    fn inst_names(&self) -> Vec<String> {
+        Db::inst_names(self)
+    }
+    fn inst_master(&self, inst: &str) -> String {
+        Db::inst_master(self, inst)
+    }
+    fn master_terms(&self, master: &str) -> Vec<(String, String)> {
+        self.master_mterms(master).unwrap_or_default()
+    }
+    fn mterm_io(&self, master: &str, term: &str) -> String {
+        self.mterm_get_io_type(master, term)
+    }
+    fn net_names(&self) -> Vec<String> {
+        Db::net_names(self)
+    }
+    fn net_sigtype(&self, net: &str) -> String {
+        Db::net_sigtype(self, net)
+    }
+    fn net_is_special(&self, net: &str) -> bool {
+        Db::net_is_special(self, net)
+    }
+    fn net_bterms(&self, net: &str) -> Vec<String> {
+        Db::net_bterms(self, net)
+    }
+    fn bterm_sig(&self, bterm: &str) -> String {
+        self.bterm_get_sig_type(bterm)
+    }
+    fn bterm_io(&self, bterm: &str) -> String {
+        self.bterm_get_io_type(bterm)
+    }
+    fn net_iterms(&self, net: &str) -> Vec<String> {
+        Db::net_iterms(self, net)
+    }
+}
+
 /// The design as the simulation reads it — read once, and read alike by every simulation of the
-/// same design state (only the seeds differ between them).
+/// same design state (only the seeds differ between them). Pins are dense indices: every leaf
+/// instance's terminals in its master's order (instances in name order), then the top-level ports
+/// in the order the nets name them. A simulation keys its values by index, not by name.
 #[derive(Debug, Default)]
 pub struct Network {
-    /// Each pin's net, and each net's pins.
-    net_of: BTreeMap<Pin, String>,
-    pins_of: BTreeMap<String, Vec<Pin>>,
-    /// The database direction of each pin (`network_->direction`): a port's, or its master
-    /// terminal's.
-    dir: BTreeMap<Pin, String>,
-    /// Each instance's master, and its terminals in the master's order.
-    master: BTreeMap<String, String>,
-    terms: BTreeMap<String, Vec<String>>,
+    /// Leaf instances in name order, each one's master (an index into `masters`).
+    insts: Vec<String>,
+    inst_master: Vec<u32>,
+    masters: Vec<String>,
+    /// Each master's terminals in the master's order.
+    master_terms: Vec<Vec<String>>,
+    /// The first pin of each instance; `term_base[i] + k` is terminal `k` of instance `i`.
+    term_base: Vec<u32>,
+    /// Each instance pin's instance.
+    pin_inst: Vec<u32>,
+    /// The top-level ports; port `k` is pin `pin_inst.len() + k`.
+    ports: Vec<String>,
+    /// Each pin's direction and net (`NO_NET`: no net reads it), and each net's pins in read order.
+    dir: Vec<Dir>,
+    net_of: Vec<u32>,
+    pins_of: Vec<Vec<u32>>,
     /// The supply nets (`findConstantNets`) and their values, in net order.
-    supply: Vec<(String, bool)>,
+    supply: Vec<(u32, bool)>,
+    inst_index: HashMap<String, u32>,
+    port_index: HashMap<String, u32>,
+}
+
+impl Network {
+    /// The design read once: every net's network pins, each pin's direction, every leaf
+    /// instance's master and terminals, and the supply nets.
+    pub fn read(db: &Db) -> Res<Network> {
+        Network::read_from(db)
+    }
+
+    fn read_from(db: &impl Source) -> Res<Network> {
+        let mut nw = Network::default();
+        let is_supply = |sig: &str| matches!(sig, "POWER" | "GROUND");
+        // `ensureConstantFuncPins` walks EVERY leaf instance — a tie cell whose output reaches no
+        // net still holds its constant.
+        let mut insts = db.inst_names();
+        insts.sort();
+        insts.dedup();
+        let mut master_index: HashMap<String, u32> = HashMap::new();
+        // 🔑 `dbITerm::getSigType` / `getIoType` read the terminal's MTERM, so both are facts of the
+        // master: read once per master, not once per instance pin.
+        let mut term_supply: Vec<Vec<bool>> = Vec::new();
+        let mut term_dir: Vec<Vec<Dir>> = Vec::new();
+        for inst in &insts {
+            let master = db.inst_master(inst);
+            let m = match master_index.get(&master) {
+                Some(&m) => m,
+                None => {
+                    let terms = db.master_terms(&master);
+                    term_supply.push(terms.iter().map(|(_, sig)| is_supply(sig)).collect());
+                    term_dir.push(terms.iter().map(|(t, _)| Dir::of(&db.mterm_io(&master, t))).collect());
+                    nw.master_terms.push(terms.into_iter().map(|(t, _)| t).collect());
+                    let m = nw.masters.len() as u32;
+                    nw.masters.push(master.clone());
+                    master_index.insert(master, m);
+                    m
+                }
+            };
+            let i = nw.insts.len() as u32;
+            nw.inst_index.insert(inst.clone(), i);
+            nw.term_base.push(nw.pin_inst.len() as u32);
+            nw.pin_inst.extend(std::iter::repeat_n(i, nw.master_terms[m as usize].len()));
+            nw.inst_master.push(m);
+            nw.insts.push(inst.clone());
+        }
+        nw.term_base.push(nw.pin_inst.len() as u32);
+        nw.dir = vec![Dir::default(); nw.pin_inst.len()];
+        nw.net_of = vec![NO_NET; nw.pin_inst.len()];
+        for net in db.net_names() {
+            let n = nw.pins_of.len() as u32;
+            let sig = db.net_sigtype(&net);
+            match sig.as_str() {
+                // `dbNetwork::findConstantNets`: a ground net is a constant 0, a power net a 1.
+                "GROUND" => nw.supply.push((n, false)),
+                "POWER" => nw.supply.push((n, true)),
+                _ => {}
+            }
+            // 🔑 `dbNetwork::isPGSupply`: a terminal is no network pin at all when it is a supply
+            // terminal, or sits on a SPECIAL supply net — so a power grid's pins are never seeded,
+            // and only a signal pin tied to an ordinary supply net becomes a constant.
+            let pg_net = db.net_is_special(&net) && is_supply(&sig);
+            let mut pins = Vec::new();
+            for b in db.net_bterms(&net) {
+                if pg_net || is_supply(&db.bterm_sig(&b)) {
+                    continue;
+                }
+                let p = match nw.port_index.get(&b) {
+                    Some(&k) => nw.pin_inst.len() as u32 + k,
+                    None => {
+                        let k = nw.ports.len() as u32;
+                        nw.port_index.insert(b.clone(), k);
+                        nw.ports.push(b.clone());
+                        nw.dir.push(Dir::default());
+                        nw.net_of.push(NO_NET);
+                        nw.pin_inst.len() as u32 + k
+                    }
+                };
+                nw.dir[p as usize] = Dir::of(&db.bterm_io(&b));
+                pins.push(p);
+            }
+            for it in db.net_iterms(&net) {
+                // ⛔ The LAST '/': a flattened hierarchical instance name contains '/' itself.
+                let Some((inst, mterm)) = it.rsplit_once('/') else { continue };
+                let Some(&i) = nw.inst_index.get(inst) else { return Err(format!("sim: {it}: no such instance").into()) };
+                let m = nw.inst_master[i as usize] as usize;
+                let Some(k) = nw.master_terms[m].iter().position(|t| t == mterm) else {
+                    return Err(format!("sim: {it}: not a terminal of {}", nw.masters[m]).into());
+                };
+                if pg_net || term_supply[m][k] {
+                    continue;
+                }
+                let p = nw.term_base[i as usize] + k as u32;
+                nw.dir[p as usize] = term_dir[m][k];
+                pins.push(p);
+            }
+            for &p in &pins {
+                nw.net_of[p as usize] = n;
+            }
+            nw.pins_of.push(pins);
+        }
+        Ok(nw)
+    }
+
+    /// The index of a pin, if the network has it: a port some net names, or a terminal of a
+    /// leaf instance's master.
+    fn index(&self, pin: &Pin) -> Option<u32> {
+        match pin {
+            Pin::Port(p) => self.port_index.get(p).map(|k| self.pin_inst.len() as u32 + k),
+            Pin::ITerm(inst, term) => {
+                let i = *self.inst_index.get(inst)? as usize;
+                let k = self.master_terms[self.inst_master[i] as usize].iter().position(|t| t == term)?;
+                Some(self.term_base[i] + k as u32)
+            }
+        }
+    }
+
+    /// The pin at an index, by name.
+    fn pin(&self, p: u32) -> Pin {
+        let p = p as usize;
+        match self.pin_inst.get(p) {
+            Some(&i) => {
+                let i = i as usize;
+                let k = p - self.term_base[i] as usize;
+                Pin::ITerm(self.insts[i].clone(), self.master_terms[self.inst_master[i] as usize][k].clone())
+            }
+            None => Pin::Port(self.ports[p - self.pin_inst.len()].clone()),
+        }
+    }
+
+    /// `Network::isDriver`: an instance output, or a top-level input port.
+    fn is_driver(&self, p: u32) -> bool {
+        let d = self.dir[p as usize];
+        if (p as usize) < self.pin_inst.len() { d.output } else { d.input }
+    }
+
+    /// `Network::isLoad`: an instance input, or a top-level output port.
+    fn is_load(&self, p: u32) -> bool {
+        let d = self.dir[p as usize];
+        if (p as usize) < self.pin_inst.len() { d.input } else { d.output }
+    }
 }
 
 struct Sim<'a> {
-    lib: &'a LibertyClocks,
     nw: &'a Network,
-    values: BTreeMap<Pin, bool>,
-    queue: VecDeque<String>,
+    /// Each master's library cell (`None`: the library has no such cell).
+    cells: Vec<Option<&'a crate::liberty::CellClock>>,
+    values: Vec<Option<bool>>,
+    queue: VecDeque<u32>,
     /// The constraint value of each pin `set_case_analysis` (first) or `set_logic_*` names:
     /// `None` for a transition or don't-care, which holds no constant but still blocks one.
-    constraints: BTreeMap<Pin, Option<bool>>,
+    constraints: Vec<Option<Option<bool>>>,
+    /// A constraint pin the network does not have holds its value and reaches nothing. Only the
+    /// constraints set one, so the last constraint naming it decides (case after logic).
+    off_values: BTreeMap<Pin, bool>,
     /// `propagateConstants(thru_sequentials)`: whether a sequential output takes its value from
     /// the sequential's data input (`findLogicConstants` does; `ensureConstantsPropagated` not).
     thru_sequentials: bool,
 }
 
-fn any_input(dir: &str) -> bool {
-    matches!(dir, "INPUT" | "INOUT")
-}
-
-fn any_output(dir: &str) -> bool {
-    matches!(dir, "OUTPUT" | "INOUT")
-}
-
 impl Sim<'_> {
-    /// `Network::isDriver`: an instance output, or a top-level input port.
-    fn is_driver(&self, p: &Pin) -> bool {
-        let d = self.nw.dir.get(p).map(String::as_str).unwrap_or("");
-        match p {
-            Pin::ITerm(..) => any_output(d),
-            Pin::Port(_) => any_input(d),
-        }
-    }
-
-    /// `Network::isLoad`: an instance input, or a top-level output port.
-    fn is_load(&self, p: &Pin) -> bool {
-        let d = self.nw.dir.get(p).map(String::as_str).unwrap_or("");
-        match p {
-            Pin::ITerm(..) => any_input(d),
-            Pin::Port(_) => any_output(d),
-        }
-    }
-
     /// `Sim::setPinValue`: a pin with a constraint value takes no other value (the reference
     /// warns and keeps the constraint's).
-    fn set_pin_value(&mut self, pin: &Pin, value: Option<bool>) {
-        if self.constraints.get(pin).is_some_and(|c| *c != value) {
+    fn set_pin_value(&mut self, pin: u32, value: Option<bool>) {
+        let p = pin as usize;
+        if self.constraints[p].is_some_and(|c| c != value) {
             return;
         }
-        if self.values.get(pin).copied() == value {
+        if self.values[p] == value {
             return;
         }
-        match value {
-            Some(v) => self.values.insert(pin.clone(), v),
-            None => self.values.remove(pin),
-        };
-        let d = self.nw.dir.get(pin).cloned().unwrap_or_default();
-        match pin {
+        self.values[p] = value;
+        let nw = self.nw;
+        let d = nw.dir[p];
+        match nw.pin_inst.get(p) {
             // A leaf instance's input: re-evaluate the instance (once in a row).
-            Pin::ITerm(inst, _) if any_input(&d) => {
-                if self.queue.back() != Some(inst) {
-                    self.queue.push_back(inst.clone());
+            Some(&inst) if d.input => {
+                if self.queue.back() != Some(&inst) {
+                    self.queue.push_back(inst);
                 }
             }
-            _ if self.is_driver(pin) => {
-                let Some(net) = self.nw.net_of.get(pin).cloned() else { return };
-                let loads: Vec<Pin> = self.nw.pins_of.get(&net).into_iter().flatten().filter(|p| *p != pin && self.is_load(p)).cloned().collect();
-                for l in loads {
-                    self.set_pin_value(&l, value);
+            _ if nw.is_driver(pin) => {
+                let net = nw.net_of[p];
+                if net == NO_NET {
+                    return;
+                }
+                for &l in &nw.pins_of[net as usize] {
+                    if l != pin && nw.is_load(l) {
+                        self.set_pin_value(l, value);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// [`Sim::set_pin_value`] by name: a pin the network does not have only holds the value.
+    fn set_named_pin_value(&mut self, pin: &Pin, value: Option<bool>) {
+        match self.nw.index(pin) {
+            Some(p) => self.set_pin_value(p, value),
+            None => {
+                match value {
+                    Some(v) => self.off_values.insert(pin.clone(), v),
+                    None => self.off_values.remove(pin),
+                };
+            }
         }
     }
 
@@ -135,7 +350,7 @@ impl Sim<'_> {
     fn set_constraint_const_pins(&mut self, c: &Constraints) {
         for map in [&c.logic, &c.case] {
             for (p, v) in map {
-                self.set_pin_value(p, *v);
+                self.set_named_pin_value(p, *v);
             }
         }
     }
@@ -143,35 +358,44 @@ impl Sim<'_> {
     /// `Sim::evalInstance(inst, thru_sequentials)`. Through sequentials, an output whose function
     /// is a lone state variable (`expr->port()`) a sequential drives is that sequential's DATA
     /// expression, inverted for its inverted output.
-    fn eval_instance(&mut self, inst: &str) {
-        let master = self.nw.master.get(inst).cloned().unwrap_or_default();
-        let Some(cell) = self.lib.cells.get(&master) else { return };
-        let terms = self.nw.terms.get(inst).cloned().unwrap_or_default();
-        let known = |values: &BTreeMap<Pin, bool>, port: &str| values.get(&Pin::ITerm(inst.to_string(), port.to_string())).copied();
-        for term in &terms {
+    fn eval_instance(&mut self, inst: u32) {
+        let nw = self.nw;
+        let i = inst as usize;
+        let m = nw.inst_master[i] as usize;
+        let Some(cell) = self.cells[m] else { return };
+        let terms = &nw.master_terms[m];
+        let base = nw.term_base[i];
+        for (k, term) in terms.iter().enumerate() {
             if !cell.directions.get(term).is_some_and(|d| matches!(d.as_str(), "output" | "inout")) {
                 continue;
             }
-            let value = if let Some(f) = cell.functions.get(term) {
-                match cell.tristate.get(term) {
-                    Some(en) => {
-                        if eval_constant(en, &|p| known(&self.values, p)) == Some(true) {
-                            eval_constant(f, &|p| known(&self.values, p))
-                        } else {
-                            None
+            let value = {
+                let (values, off) = (&self.values, &self.off_values);
+                let known = |port: &str| match terms.iter().position(|t| t == port) {
+                    Some(k) => values[(base + k as u32) as usize],
+                    None => off.get(&Pin::ITerm(nw.insts[i].clone(), port.to_string())).copied(),
+                };
+                if let Some(f) = cell.functions.get(term) {
+                    match cell.tristate.get(term) {
+                        Some(en) => {
+                            if eval_constant(en, &known) == Some(true) {
+                                eval_constant(f, &known)
+                            } else {
+                                None
+                            }
                         }
+                        None => function_value(cell, f, self.thru_sequentials, &known),
                     }
-                    None => function_value(cell, f, self.thru_sequentials, &|p| known(&self.values, p)),
+                } else if cell.clock_gate_out.contains(term) {
+                    // `clockGateOutValue`: 0 when the gated clock or the enable is 0.
+                    if cell.clock_gate_in.iter().any(|p| known(p) == Some(false)) { Some(false) } else { None }
+                } else {
+                    None
                 }
-            } else if cell.clock_gate_out.contains(term) {
-                // `clockGateOutValue`: 0 when the gated clock or the enable is 0.
-                if cell.clock_gate_in.iter().any(|p| known(&self.values, p) == Some(false)) { Some(false) } else { None }
-            } else {
-                None
             };
-            let pin = Pin::ITerm(inst.to_string(), term.clone());
-            if value != self.values.get(&pin).copied() {
-                self.set_pin_value(&pin, value);
+            let pin = base + k as u32;
+            if value != self.values[pin as usize] {
+                self.set_pin_value(pin, value);
             }
         }
     }
@@ -229,100 +453,57 @@ fn propagate(db: &Db, lib: &LibertyClocks, thru_sequentials: bool, c: &Constrain
     Ok(run(&Network::read(db)?, lib, thru_sequentials, c))
 }
 
-impl Network {
-    /// The design read once: every net's network pins, each pin's direction, every leaf
-    /// instance's master and terminals, and the supply nets.
-    pub fn read(db: &Db) -> Res<Network> {
-        let mut sim = Network::default();
-        let is_supply = |sig: &str| matches!(sig, "POWER" | "GROUND");
-        for net in db.net_names() {
-            let sig = db.net_sigtype(&net);
-            match sig.as_str() {
-                // `dbNetwork::findConstantNets`: a ground net is a constant 0, a power net a 1.
-                "GROUND" => sim.supply.push((net.clone(), false)),
-                "POWER" => sim.supply.push((net.clone(), true)),
-                _ => {}
-            }
-            // 🔑 `dbNetwork::isPGSupply`: a terminal is no network pin at all when it is a supply
-            // terminal, or sits on a SPECIAL supply net — so a power grid's pins are never seeded,
-            // and only a signal pin tied to an ordinary supply net becomes a constant.
-            let pg_net = db.net_is_special(&net) && is_supply(&sig);
-            let mut pins = Vec::new();
-            for b in db.net_bterms(&net) {
-                if pg_net || is_supply(&db.bterm_get_sig_type(&b)) {
-                    continue;
-                }
-                let p = Pin::Port(b.clone());
-                sim.dir.insert(p.clone(), db.bterm_get_io_type(&b));
-                pins.push(p);
-            }
-            for it in db.net_iterms(&net) {
-                // ⛔ The LAST '/': a flattened hierarchical instance name contains '/' itself.
-                let Some((inst, mterm)) = it.rsplit_once('/') else { continue };
-                if pg_net || is_supply(&db.iterm_get_sig_type(inst, mterm)) {
-                    continue;
-                }
-                let master = sim.master.entry(inst.to_string()).or_insert_with(|| db.inst_master(inst)).clone();
-                let p = Pin::ITerm(inst.to_string(), mterm.to_string());
-                sim.dir.insert(p.clone(), db.mterm_get_io_type(&master, mterm));
-                pins.push(p);
-            }
-            for p in &pins {
-                sim.net_of.insert(p.clone(), net.clone());
-            }
-            sim.pins_of.insert(net, pins);
-        }
-        // `ensureConstantFuncPins` walks EVERY leaf instance — a tie cell whose output reaches no net
-        // still holds its constant.
-        for inst in db.inst_names() {
-            if let std::collections::btree_map::Entry::Vacant(e) = sim.master.entry(inst) {
-                let m = db.inst_master(e.key());
-                e.insert(m);
-            }
-        }
-        let mut by_master: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (inst, master) in &sim.master {
-            let terms = by_master
-                .entry(master.clone())
-                .or_insert_with(|| db.master_mterms(master).map(|v| v.into_iter().map(|(n, _)| n).collect()).unwrap_or_default())
-                .clone();
-            sim.terms.insert(inst.clone(), terms);
-        }
-        Ok(sim)
-    }
-}
 
 /// One simulation over a read [`Network`]: the seeds (supplies, then the constraints, then the
 /// constant-function outputs), then `propagateConstants(thru_sequentials)`.
 fn run(nw: &Network, lib: &LibertyClocks, thru_sequentials: bool, c: &Constraints) -> BTreeMap<Pin, bool> {
-    let mut constraints = c.logic.clone();
-    constraints.extend(c.case.iter().map(|(p, v)| (p.clone(), *v)));
-    let mut sim = Sim { lib, nw, values: BTreeMap::new(), queue: VecDeque::new(), constraints, thru_sequentials };
+    let pins = nw.dir.len();
+    let mut sim = Sim {
+        nw,
+        cells: nw.masters.iter().map(|m| lib.cells.get(m)).collect(),
+        values: vec![None; pins],
+        queue: VecDeque::new(),
+        constraints: vec![None; pins],
+        off_values: BTreeMap::new(),
+        thru_sequentials,
+    };
+    // A pin in both takes its case value (`setPinValue` asks the case analysis first).
+    for (p, v) in c.logic.iter().chain(&c.case) {
+        if let Some(i) = nw.index(p) {
+            sim.constraints[i as usize] = Some(*v);
+        }
+    }
     // seedConstants: the network's constant pins, ground nets first, then power nets.
     for value in [false, true] {
-        for (net, v) in nw.supply.iter().filter(|(_, v)| *v == value) {
-            for p in nw.pins_of.get(net).cloned().unwrap_or_default() {
-                sim.set_pin_value(&p, Some(*v));
+        for &(net, v) in nw.supply.iter().filter(|(_, v)| *v == value) {
+            for &p in &nw.pins_of[net as usize] {
+                sim.set_pin_value(p, Some(v));
             }
         }
     }
     sim.set_constraint_const_pins(c);
     // setConstFuncPins: every instance output whose function is a constant (a tie cell).
-    let insts: Vec<(String, String)> = nw.master.iter().map(|(i, m)| (i.clone(), m.clone())).collect();
-    for (inst, master) in insts {
-        let Some(cell) = lib.cells.get(&master) else { continue };
-        for term in nw.terms.get(&inst).cloned().unwrap_or_default() {
-            if cell.constant_outputs.contains(&term) {
-                let one = cell.functions.get(&term).is_some_and(|f| eval_constant(f, &|_| None) == Some(true));
-                sim.set_pin_value(&Pin::ITerm(inst.clone(), term), Some(one));
+    for i in 0..nw.insts.len() {
+        let m = nw.inst_master[i] as usize;
+        let Some(cell) = sim.cells[m] else { continue };
+        for (k, term) in nw.master_terms[m].iter().enumerate() {
+            if cell.constant_outputs.contains(term) {
+                let one = cell.functions.get(term).is_some_and(|f| eval_constant(f, &|_| None) == Some(true));
+                sim.set_pin_value(nw.term_base[i] + k as u32, Some(one));
             }
         }
     }
     // propagateConstants(false).
     while let Some(inst) = sim.queue.pop_front() {
-        sim.eval_instance(&inst);
+        sim.eval_instance(inst);
     }
-    sim.values
+    let mut out = sim.off_values;
+    for (p, v) in sim.values.iter().enumerate() {
+        if let Some(v) = v {
+            out.insert(nw.pin(p as u32), *v);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -364,28 +545,491 @@ mod tests {
         assert_eq!(function_value(&c, &c.functions["Q"].clone(), true, &d1), Some(true));
     }
 
-    /// `kld` -> u1 (buffer) -> u2 (inverter), as the Sim reads a netlist.
-    fn chain() -> Network {
-        let it = |i: &str, t: &str| Pin::ITerm(i.into(), t.into());
-        let nets = [("kld", vec![Pin::Port("kld".into()), it("u1", "A")]), ("n1", vec![it("u1", "Z"), it("u2", "A")]), ("n2", vec![it("u2", "ZN")])];
-        let mut nw = Network {
-            master: [("u1".into(), "buf".into()), ("u2".into(), "inv".into())].into(),
-            terms: [("u1".into(), vec!["A".into(), "Z".into()]), ("u2".into(), vec!["A".into(), "ZN".into()])].into(),
-            ..Default::default()
-        };
-        for (net, pins) in nets {
-            for p in &pins {
-                nw.net_of.insert(p.clone(), net.into());
-                let d = match p {
-                    Pin::Port(_) => "INPUT",
-                    Pin::ITerm(_, t) if t == "A" => "INPUT",
-                    _ => "OUTPUT",
-                };
-                nw.dir.insert(p.clone(), d.into());
-            }
-            nw.pins_of.insert(net.into(), pins);
+    /// The simulation keyed by NAME, as it ran before pins were indexed: the test oracle for the
+    /// indexed one. An instance pin's signal type is read per pin here (`dbITerm::getSigType`),
+    /// per master in the indexed read.
+    mod by_name {
+        #![allow(dead_code)]
+        use super::super::{eval_constant, function_value, Constraints, LibertyClocks, Pin, Res, Source};
+        use std::collections::{BTreeMap, VecDeque};
+
+        fn iterm_sig(db: &impl Source, inst: &str, mterm: &str) -> String {
+            db.master_terms(&db.inst_master(inst)).into_iter().find(|(t, _)| t == mterm).map(|(_, s)| s).unwrap_or_default()
         }
-        nw
+
+        /// The design as the simulation reads it — read once, and read alike by every simulation of the
+        /// same design state (only the seeds differ between them).
+        #[derive(Debug, Default)]
+        pub struct Network {
+            /// Each pin's net, and each net's pins.
+            net_of: BTreeMap<Pin, String>,
+            pins_of: BTreeMap<String, Vec<Pin>>,
+            /// The database direction of each pin (`network_->direction`): a port's, or its master
+            /// terminal's.
+            dir: BTreeMap<Pin, String>,
+            /// Each instance's master, and its terminals in the master's order.
+            master: BTreeMap<String, String>,
+            terms: BTreeMap<String, Vec<String>>,
+            /// The supply nets (`findConstantNets`) and their values, in net order.
+            supply: Vec<(String, bool)>,
+        }
+
+        struct Sim<'a> {
+            lib: &'a LibertyClocks,
+            nw: &'a Network,
+            values: BTreeMap<Pin, bool>,
+            queue: VecDeque<String>,
+            /// The constraint value of each pin `set_case_analysis` (first) or `set_logic_*` names:
+            /// `None` for a transition or don't-care, which holds no constant but still blocks one.
+            constraints: BTreeMap<Pin, Option<bool>>,
+            /// `propagateConstants(thru_sequentials)`: whether a sequential output takes its value from
+            /// the sequential's data input (`findLogicConstants` does; `ensureConstantsPropagated` not).
+            thru_sequentials: bool,
+        }
+
+        fn any_input(dir: &str) -> bool {
+            matches!(dir, "INPUT" | "INOUT")
+        }
+
+        fn any_output(dir: &str) -> bool {
+            matches!(dir, "OUTPUT" | "INOUT")
+        }
+
+        impl Sim<'_> {
+            /// `Network::isDriver`: an instance output, or a top-level input port.
+            fn is_driver(&self, p: &Pin) -> bool {
+                let d = self.nw.dir.get(p).map(String::as_str).unwrap_or("");
+                match p {
+                    Pin::ITerm(..) => any_output(d),
+                    Pin::Port(_) => any_input(d),
+                }
+            }
+
+            /// `Network::isLoad`: an instance input, or a top-level output port.
+            fn is_load(&self, p: &Pin) -> bool {
+                let d = self.nw.dir.get(p).map(String::as_str).unwrap_or("");
+                match p {
+                    Pin::ITerm(..) => any_input(d),
+                    Pin::Port(_) => any_output(d),
+                }
+            }
+
+            /// `Sim::setPinValue`: a pin with a constraint value takes no other value (the reference
+            /// warns and keeps the constraint's).
+            fn set_pin_value(&mut self, pin: &Pin, value: Option<bool>) {
+                if self.constraints.get(pin).is_some_and(|c| *c != value) {
+                    return;
+                }
+                if self.values.get(pin).copied() == value {
+                    return;
+                }
+                match value {
+                    Some(v) => self.values.insert(pin.clone(), v),
+                    None => self.values.remove(pin),
+                };
+                let d = self.nw.dir.get(pin).cloned().unwrap_or_default();
+                match pin {
+                    // A leaf instance's input: re-evaluate the instance (once in a row).
+                    Pin::ITerm(inst, _) if any_input(&d) => {
+                        if self.queue.back() != Some(inst) {
+                            self.queue.push_back(inst.clone());
+                        }
+                    }
+                    _ if self.is_driver(pin) => {
+                        let Some(net) = self.nw.net_of.get(pin).cloned() else { return };
+                        let loads: Vec<Pin> = self.nw.pins_of.get(&net).into_iter().flatten().filter(|p| *p != pin && self.is_load(p)).cloned().collect();
+                        for l in loads {
+                            self.set_pin_value(&l, value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            /// `setConstraintConstPins`: the `set_logic_*` values, then the `set_case_analysis` values.
+            fn set_constraint_const_pins(&mut self, c: &Constraints) {
+                for map in [&c.logic, &c.case] {
+                    for (p, v) in map {
+                        self.set_pin_value(p, *v);
+                    }
+                }
+            }
+
+            /// `Sim::evalInstance(inst, thru_sequentials)`. Through sequentials, an output whose function
+            /// is a lone state variable (`expr->port()`) a sequential drives is that sequential's DATA
+            /// expression, inverted for its inverted output.
+            fn eval_instance(&mut self, inst: &str) {
+                let master = self.nw.master.get(inst).cloned().unwrap_or_default();
+                let Some(cell) = self.lib.cells.get(&master) else { return };
+                let terms = self.nw.terms.get(inst).cloned().unwrap_or_default();
+                let known = |values: &BTreeMap<Pin, bool>, port: &str| values.get(&Pin::ITerm(inst.to_string(), port.to_string())).copied();
+                for term in &terms {
+                    if !cell.directions.get(term).is_some_and(|d| matches!(d.as_str(), "output" | "inout")) {
+                        continue;
+                    }
+                    let value = if let Some(f) = cell.functions.get(term) {
+                        match cell.tristate.get(term) {
+                            Some(en) => {
+                                if eval_constant(en, &|p| known(&self.values, p)) == Some(true) {
+                                    eval_constant(f, &|p| known(&self.values, p))
+                                } else {
+                                    None
+                                }
+                            }
+                            None => function_value(cell, f, self.thru_sequentials, &|p| known(&self.values, p)),
+                        }
+                    } else if cell.clock_gate_out.contains(term) {
+                        // `clockGateOutValue`: 0 when the gated clock or the enable is 0.
+                        if cell.clock_gate_in.iter().any(|p| known(&self.values, p) == Some(false)) { Some(false) } else { None }
+                    } else {
+                        None
+                    };
+                    let pin = Pin::ITerm(inst.to_string(), term.clone());
+                    if value != self.values.get(&pin).copied() {
+                        self.set_pin_value(&pin, value);
+                    }
+                }
+            }
+        }
+
+        impl Network {
+            /// The design read once: every net's network pins, each pin's direction, every leaf
+            /// instance's master and terminals, and the supply nets.
+            pub fn read(db: &impl Source) -> Res<Network> {
+                let mut sim = Network::default();
+                let is_supply = |sig: &str| matches!(sig, "POWER" | "GROUND");
+                for net in db.net_names() {
+                    let sig = db.net_sigtype(&net);
+                    match sig.as_str() {
+                        // `dbNetwork::findConstantNets`: a ground net is a constant 0, a power net a 1.
+                        "GROUND" => sim.supply.push((net.clone(), false)),
+                        "POWER" => sim.supply.push((net.clone(), true)),
+                        _ => {}
+                    }
+                    // 🔑 `dbNetwork::isPGSupply`: a terminal is no network pin at all when it is a supply
+                    // terminal, or sits on a SPECIAL supply net — so a power grid's pins are never seeded,
+                    // and only a signal pin tied to an ordinary supply net becomes a constant.
+                    let pg_net = db.net_is_special(&net) && is_supply(&sig);
+                    let mut pins = Vec::new();
+                    for b in db.net_bterms(&net) {
+                        if pg_net || is_supply(&db.bterm_sig(&b)) {
+                            continue;
+                        }
+                        let p = Pin::Port(b.clone());
+                        sim.dir.insert(p.clone(), db.bterm_io(&b));
+                        pins.push(p);
+                    }
+                    for it in db.net_iterms(&net) {
+                        // ⛔ The LAST '/': a flattened hierarchical instance name contains '/' itself.
+                        let Some((inst, mterm)) = it.rsplit_once('/') else { continue };
+                        if pg_net || is_supply(&iterm_sig(db, inst, mterm)) {
+                            continue;
+                        }
+                        let master = sim.master.entry(inst.to_string()).or_insert_with(|| db.inst_master(inst)).clone();
+                        let p = Pin::ITerm(inst.to_string(), mterm.to_string());
+                        sim.dir.insert(p.clone(), db.mterm_io(&master, mterm));
+                        pins.push(p);
+                    }
+                    for p in &pins {
+                        sim.net_of.insert(p.clone(), net.clone());
+                    }
+                    sim.pins_of.insert(net, pins);
+                }
+                // `ensureConstantFuncPins` walks EVERY leaf instance — a tie cell whose output reaches no net
+                // still holds its constant.
+                for inst in db.inst_names() {
+                    if let std::collections::btree_map::Entry::Vacant(e) = sim.master.entry(inst) {
+                        let m = db.inst_master(e.key());
+                        e.insert(m);
+                    }
+                }
+                let mut by_master: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for (inst, master) in &sim.master {
+                    let terms = by_master
+                        .entry(master.clone())
+                        .or_insert_with(|| db.master_terms(master).into_iter().map(|(n, _)| n).collect())
+                        .clone();
+                    sim.terms.insert(inst.clone(), terms);
+                }
+                Ok(sim)
+            }
+        }
+
+        /// One simulation over a read [`Network`]: the seeds (supplies, then the constraints, then the
+        /// constant-function outputs), then `propagateConstants(thru_sequentials)`.
+        pub fn run(nw: &Network, lib: &LibertyClocks, thru_sequentials: bool, c: &Constraints) -> BTreeMap<Pin, bool> {
+            let mut constraints = c.logic.clone();
+            constraints.extend(c.case.iter().map(|(p, v)| (p.clone(), *v)));
+            let mut sim = Sim { lib, nw, values: BTreeMap::new(), queue: VecDeque::new(), constraints, thru_sequentials };
+            // seedConstants: the network's constant pins, ground nets first, then power nets.
+            for value in [false, true] {
+                for (net, v) in nw.supply.iter().filter(|(_, v)| *v == value) {
+                    for p in nw.pins_of.get(net).cloned().unwrap_or_default() {
+                        sim.set_pin_value(&p, Some(*v));
+                    }
+                }
+            }
+            sim.set_constraint_const_pins(c);
+            // setConstFuncPins: every instance output whose function is a constant (a tie cell).
+            let insts: Vec<(String, String)> = nw.master.iter().map(|(i, m)| (i.clone(), m.clone())).collect();
+            for (inst, master) in insts {
+                let Some(cell) = lib.cells.get(&master) else { continue };
+                for term in nw.terms.get(&inst).cloned().unwrap_or_default() {
+                    if cell.constant_outputs.contains(&term) {
+                        let one = cell.functions.get(&term).is_some_and(|f| eval_constant(f, &|_| None) == Some(true));
+                        sim.set_pin_value(&Pin::ITerm(inst.clone(), term), Some(one));
+                    }
+                }
+            }
+            // propagateConstants(false).
+            while let Some(inst) = sim.queue.pop_front() {
+                sim.eval_instance(&inst);
+            }
+            sim.values
+        }
+    }
+
+    /// A hand-written design, read through the same [`Source`] calls a `Db` answers.
+    #[derive(Default, Clone)]
+    struct Design {
+        /// Instances in block order, each with its master.
+        insts: Vec<(String, String)>,
+        /// Each master's terminals: name, signal type, direction.
+        masters: BTreeMap<String, Vec<(String, String, String)>>,
+        nets: Vec<NetDef>,
+    }
+
+    #[derive(Default, Clone)]
+    struct NetDef {
+        name: String,
+        sig: String,
+        special: bool,
+        /// Ports: name, signal type, direction.
+        bterms: Vec<(String, String, String)>,
+        /// `inst/term`.
+        iterms: Vec<String>,
+    }
+
+    impl Design {
+        fn net(&self, net: &str) -> &NetDef {
+            self.nets.iter().find(|n| n.name == net).expect("net")
+        }
+        fn bterm(&self, b: &str) -> (String, String, String) {
+            self.nets.iter().flat_map(|n| &n.bterms).find(|t| t.0 == b).cloned().expect("bterm")
+        }
+    }
+
+    impl Source for Design {
+        fn inst_names(&self) -> Vec<String> {
+            self.insts.iter().map(|(i, _)| i.clone()).collect()
+        }
+        fn inst_master(&self, inst: &str) -> String {
+            self.insts.iter().find(|(i, _)| i == inst).map(|(_, m)| m.clone()).unwrap_or_default()
+        }
+        fn master_terms(&self, master: &str) -> Vec<(String, String)> {
+            self.masters.get(master).into_iter().flatten().map(|(t, s, _)| (t.clone(), s.clone())).collect()
+        }
+        fn mterm_io(&self, master: &str, term: &str) -> String {
+            self.masters.get(master).into_iter().flatten().find(|t| t.0 == term).map(|t| t.2.clone()).unwrap_or_default()
+        }
+        fn net_names(&self) -> Vec<String> {
+            self.nets.iter().map(|n| n.name.clone()).collect()
+        }
+        fn net_sigtype(&self, net: &str) -> String {
+            self.net(net).sig.clone()
+        }
+        fn net_is_special(&self, net: &str) -> bool {
+            self.net(net).special
+        }
+        fn net_bterms(&self, net: &str) -> Vec<String> {
+            self.net(net).bterms.iter().map(|b| b.0.clone()).collect()
+        }
+        fn bterm_sig(&self, b: &str) -> String {
+            self.bterm(b).1
+        }
+        fn bterm_io(&self, b: &str) -> String {
+            self.bterm(b).2
+        }
+        fn net_iterms(&self, net: &str) -> Vec<String> {
+            self.net(net).iterms.clone()
+        }
+    }
+
+    /// `kld` -> u1 (buffer) -> u2 (inverter), as the Sim reads a netlist.
+    fn chain_design() -> Design {
+        let sig = |t: &str, io: &str| (t.to_string(), "SIGNAL".to_string(), io.to_string());
+        let net = |name: &str, bterms: Vec<(String, String, String)>, iterms: &[&str]| NetDef {
+            name: name.into(),
+            sig: "SIGNAL".into(),
+            special: false,
+            bterms,
+            iterms: iterms.iter().map(|s| s.to_string()).collect(),
+        };
+        Design {
+            insts: vec![("u1".into(), "buf".into()), ("u2".into(), "inv".into())],
+            masters: [("buf".into(), vec![sig("A", "INPUT"), sig("Z", "OUTPUT")]), ("inv".into(), vec![sig("A", "INPUT"), sig("ZN", "OUTPUT")])].into(),
+            nets: vec![net("kld", vec![sig("kld", "INPUT")], &["u1/A"]), net("n1", vec![], &["u1/Z", "u2/A"]), net("n2", vec![], &["u2/ZN"])],
+        }
+    }
+
+    fn chain() -> Network {
+        Network::read_from(&chain_design()).unwrap()
+    }
+
+    const LIB: &str = r#"library (t) {
+        cell (buf) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+        cell (inv) { pin (A) { direction : input; } pin (ZN) { direction : output; function : "!A"; } }
+        cell (and2) { pin (A) { direction : input; } pin (B) { direction : input; } pin (Z) { direction : output; function : "A&B"; } }
+        cell (or2) { pin (A) { direction : input; } pin (B) { direction : input; } pin (Z) { direction : output; function : "A|B"; } }
+        cell (tie0) { pin (Z) { direction : output; function : "0"; } }
+        cell (tie1) { pin (Z) { direction : output; function : "1"; } }
+        cell (dff) { ff ("IQ","IQN") { clocked_on : "CK"; next_state : "D"; }
+            pin (CK) { direction : input; clock : true; } pin (D) { direction : input; }
+            pin (Q) { direction : output; function : "IQ"; } pin (QN) { direction : output; function : "IQN"; } }
+        cell (tbuf) { pin (A) { direction : input; } pin (EN) { direction : input; }
+            pin (Z) { direction : output; function : "A"; three_state : "!EN"; } }
+        cell (icg) { pin (CK) { direction : input; clock_gate_clock_pin : true; } pin (E) { direction : input; clock_gate_enable_pin : true; }
+            pin (GCK) { direction : output; clock_gate_out_pin : true; } }
+        cell (bidi) { pin (A) { direction : input; } pin (EN) { direction : input; }
+            pin (Y) { direction : inout; function : "A"; three_state : "!EN"; } } }"#;
+
+    /// A generated design over [`LIB`]'s cells (plus a master the library lacks): supply
+    /// terminals on every master, special and ordinary supply nets, ports both ways, unconnected
+    /// terminals, hierarchical names; and constraints on ports, terminals and pins the network
+    /// does not have.
+    fn random_design(seed: u64) -> (Design, Constraints) {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut rnd = |n: usize| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as usize) % n.max(1)
+        };
+        let cells: [(&str, &[&str], &[&str]); 11] = [
+            ("buf", &["A"], &["Z"]),
+            ("inv", &["A"], &["ZN"]),
+            ("and2", &["A", "B"], &["Z"]),
+            ("or2", &["A", "B"], &["Z"]),
+            ("tie0", &[], &["Z"]),
+            ("tie1", &[], &["Z"]),
+            ("dff", &["CK", "D"], &["Q", "QN"]),
+            ("tbuf", &["A", "EN"], &["Z"]),
+            ("icg", &["CK", "E"], &["GCK"]),
+            ("nolib", &["A"], &["Z"]),
+            ("bidi", &["A", "EN"], &["Y"]),
+        ];
+        let mut d = Design::default();
+        for (m, ins, outs) in cells {
+            let mut terms: Vec<(String, String, String)> = vec![("VDD".into(), "POWER".into(), "INOUT".into())];
+            terms.extend(ins.iter().map(|t| (t.to_string(), "SIGNAL".to_string(), "INPUT".to_string())));
+            terms.extend(outs.iter().map(|t| (t.to_string(), "SIGNAL".to_string(), if *t == "Y" { "INOUT" } else { "OUTPUT" }.to_string())));
+            terms.push(("VSS".into(), "GROUND".into(), "INOUT".into()));
+            d.masters.insert(m.into(), terms);
+        }
+        let n_inst = 1 + rnd(24);
+        for k in 0..n_inst {
+            let name = if rnd(4) == 0 { format!("top/sub{}/u{k}", rnd(3)) } else { format!("u{k}") };
+            d.insts.push((name, cells[rnd(cells.len())].0.to_string()));
+        }
+        let vdd_special = rnd(2) == 0;
+        let mut supply = vec![
+            NetDef { name: "VDD".into(), sig: "POWER".into(), special: vdd_special, ..Default::default() },
+            NetDef { name: "VSS".into(), sig: "GROUND".into(), special: true, ..Default::default() },
+            NetDef { name: "tie_hi".into(), sig: "POWER".into(), special: false, ..Default::default() },
+            NetDef { name: "tie_lo".into(), sig: "GROUND".into(), special: false, ..Default::default() },
+        ];
+        // Driven nets: input ports, then instance outputs.
+        let mut nets: Vec<NetDef> = Vec::new();
+        for k in 0..rnd(4) {
+            let p = format!("in{k}");
+            nets.push(NetDef { name: format!("n_{p}"), sig: "SIGNAL".into(), bterms: vec![(p, "SIGNAL".into(), "INPUT".into())], ..Default::default() });
+        }
+        for (inst, m) in d.insts.clone() {
+            for (t, sig, io) in d.masters[&m].clone() {
+                if sig != "SIGNAL" {
+                    let net = if t == "VDD" { 0 } else { 1 };
+                    if rnd(5) != 0 {
+                        supply[net].iterms.push(format!("{inst}/{t}"));
+                    }
+                } else if io != "INPUT" && rnd(5) != 0 {
+                    nets.push(NetDef { name: format!("n_{inst}_{t}"), sig: "SIGNAL".into(), iterms: vec![format!("{inst}/{t}")], ..Default::default() });
+                }
+            }
+        }
+        // Loads: each input onto a driven net, a tie net, or nothing.
+        for (inst, m) in d.insts.clone() {
+            for (t, sig, io) in d.masters[&m].clone() {
+                if sig != "SIGNAL" || io != "INPUT" {
+                    continue;
+                }
+                match rnd(10) {
+                    0 => {}
+                    1 => supply[2].iterms.push(format!("{inst}/{t}")),
+                    2 => supply[3].iterms.push(format!("{inst}/{t}")),
+                    _ if !nets.is_empty() => {
+                        let k = rnd(nets.len());
+                        nets[k].iterms.push(format!("{inst}/{t}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for k in 0..rnd(3) {
+            if nets.is_empty() {
+                break;
+            }
+            let n = rnd(nets.len());
+            nets[n].bterms.push((format!("out{k}"), "SIGNAL".into(), if rnd(3) == 0 { "INOUT" } else { "OUTPUT" }.into()));
+        }
+        if rnd(3) == 0 {
+            supply[0].bterms.push(("vdd_pad".into(), "POWER".into(), "INOUT".into()));
+        }
+        for n in &mut nets {
+            n.iterms.reverse();
+        }
+        d.nets = nets;
+        d.nets.extend(supply);
+        let k = rnd(d.nets.len() + 1).min(d.nets.len());
+        d.nets.rotate_left(k);
+        // Constraints: ports, connected and unconnected terminals, pins the network lacks.
+        let mut pins: Vec<Pin> = d.nets.iter().flat_map(|n| n.bterms.iter().map(|b| Pin::Port(b.0.clone()))).collect();
+        for (inst, m) in &d.insts {
+            pins.extend(d.masters[m].iter().map(|t| Pin::ITerm(inst.clone(), t.0.clone())));
+        }
+        pins.push(Pin::Port("ghost_port".into()));
+        pins.push(Pin::ITerm("ghost".into(), "A".into()));
+        pins.push(Pin::ITerm(d.insts[0].0.clone(), "NOT_A_TERM".into()));
+        let mut c = Constraints::default();
+        for _ in 0..rnd(6) {
+            let p = pins[rnd(pins.len())].clone();
+            let v = [Some(false), Some(true), None][rnd(3)];
+            if rnd(2) == 0 { c.logic.insert(p, v) } else { c.case.insert(p, v) };
+        }
+        (d, c)
+    }
+
+    /// Rule (`Sim::setPinValue` / `evalInstance` / `seedConstants` read pins through the network,
+    /// whatever names them; `dbITerm::getSigType` / `getIoType` are the MTERM's): the simulation
+    /// keyed by pin index gives, pin for pin, what the simulation keyed by name gives — over
+    /// generated designs, with and without constraints, both `propagateConstants` modes.
+    #[test]
+    fn the_indexed_simulation_gives_what_the_named_one_gives() {
+        let mut lib = LibertyClocks::default();
+        lib.read(LIB).unwrap();
+        let (mut nonempty, mut off) = (0, 0);
+        for seed in 0..400 {
+            let (d, c) = random_design(seed);
+            let nw = Network::read_from(&d).unwrap();
+            let named = by_name::Network::read(&d).unwrap();
+            for thru in [false, true] {
+                for c in [&Constraints::default(), &c] {
+                    let ours = run(&nw, &lib, thru, c);
+                    let want = by_name::run(&named, &lib, thru, c);
+                    assert_eq!(ours, want, "seed {seed} thru {thru} constraints {c:?}");
+                    nonempty += usize::from(!ours.is_empty());
+                    off += usize::from(ours.keys().any(|p| nw.index(p).is_none()));
+                }
+            }
+        }
+        assert!(nonempty > 1000 && off > 10, "the generated designs exercise the simulation: {nonempty} non-empty, {off} with an off-network pin");
     }
 
     fn buf_inv() -> LibertyClocks {
