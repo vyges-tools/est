@@ -327,6 +327,14 @@ impl Skips {
     pub fn with_clock_network_now(self, db: &Db, timing: &Timing<'_>) -> Res<Skips> {
         Ok(Skips::from_parts(clock_nets_now(db, timing)?, self.constants, timing))
     }
+
+    /// These skips' clock network (walked on the same design) with the constant pins of another
+    /// simulation of it: what [`skips_with_constants`] gives from `values`, without the clock walk.
+    /// For a caller that holds both simulations of one design state — the design's own constants
+    /// and those under the SDC's constraint values — and one walk.
+    pub fn with_constants(&self, values: &std::collections::BTreeMap<crate::sim::Pin, bool>, timing: &Timing<'_>) -> Skips {
+        Skips::from_parts(self.clock_nets.clone(), values.keys().map(|p| p.path_name()).collect(), timing)
+    }
 }
 
 /// [`skips`] with the clocks' propagation taken per clock and per pin, as the SDC left it.
@@ -620,6 +628,25 @@ mod tests {
         assert!(c.propagated_pins.is_empty());
         assert_eq!(c.ideal_sources(), ["pb"], "a pin latency leaves the clock propagated");
         assert!(c.set_propagated_clock(&[ClockObject::Clock("nope".into())]).is_err());
+    }
+
+    /// Reference rule (OpenSTA: `Sim` and `ClkNetwork` are each computed once per netlist state
+    /// and read by every caller): skips for one design state under a second simulation keep the
+    /// first walk's clock nets and take the second simulation's constants — what
+    /// `skips_with_constants` gives from those constants, without walking the clock network again.
+    #[test]
+    fn skips_under_other_constants_keep_the_clock_walk() {
+        let nets = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<String>>();
+        for propagated in [false, true] {
+            let timing = Timing { liberty: None, clock_sources: vec!["clk".into()], propagated };
+            let base = Skips::from_parts(nets(&["clk", "clknet_0"]), nets(&["tie/Y"]), &timing);
+            let values: std::collections::BTreeMap<crate::sim::Pin, bool> = [(crate::sim::Pin::ITerm("tie".into(), "Y".into()), true), (crate::sim::Pin::Port("te".into()), false)].into_iter().collect();
+            let s = base.with_constants(&values, &timing);
+            assert_eq!(s.clock_nets(), base.clock_nets(), "the clock walk is kept");
+            assert_eq!(s.constant_pins(), &nets(&["te", "tie/Y"]), "the constants are the second simulation's");
+            let none = BTreeSet::new();
+            assert_eq!(s.ideal_clock_nets(), if propagated { &none } else { base.clock_nets() });
+        }
     }
 
     fn pin(name: &str, is_port: bool) -> PinLoc {
