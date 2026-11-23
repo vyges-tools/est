@@ -22,6 +22,8 @@ pub mod wire;
 pub mod liberty;
 pub mod clk_network;
 pub mod sim;
+#[cfg(all(test, feature = "odb"))]
+mod test_design;
 pub mod placement;
 pub mod rc;
 pub mod modes;
