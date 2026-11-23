@@ -210,6 +210,15 @@ impl Rc {
         c[corner] = narrow(cap);
     }
 
+    /// Do corners `a` and `b` read the same RC wherever a net's network reads one — the wire RC
+    /// ([`Rc::resolved`]) and every layer's ([`Rc::layer_rc`]), bit for bit? The network build reads
+    /// its corner through these alone, so two such corners estimate every net alike.
+    pub fn same_corner_rc(&self, tech: &str, a: usize, b: usize) -> bool {
+        let bits = |v: [f64; 8]| v.map(f64::to_bits);
+        let layer = |m: &BTreeMap<i32, Vec<f64>>| m.values().all(|v| v.get(a).copied().unwrap_or(0.0).to_bits() == v.get(b).copied().unwrap_or(0.0).to_bits());
+        bits(self.resolved(tech, a)) == bits(self.resolved(tech, b)) && layer(&self.layer_res) && layer(&self.layer_cap)
+    }
+
     /// `layerRC(layer, corner)` — 0 when the layer or corner was never set.
     pub fn layer_rc(&self, number: i32, corner: usize) -> (f64, f64) {
         let get = |m: &BTreeMap<i32, Vec<f64>>| m.get(&number).and_then(|v| v.get(corner)).copied().unwrap_or(0.0);
@@ -543,6 +552,25 @@ mod tests {
         assert_eq!(fmt_g17(6516000.0), "6516000");
         assert_eq!(fmt_g17(1.3272000165542863e-10), "1.3272000165542863e-10");
         assert_eq!(fmt_g17(0.0), "0");
+    }
+
+    /// Rule (OpenROAD `EstimateParasitics::estimateWireParasiticSteiner`: per scene, the network
+    /// from that scene's `wireSignalRC`/`wireClkRC` and `layerRC` alone): two corners read alike
+    /// exactly when every one of those reads is equal, bit for bit.
+    #[test]
+    fn two_corners_read_alike_only_when_every_rc_they_read_is_equal() {
+        let mut rc = Rc { scenes: vec!["a".into(), "b".into(), "c".into()], ..Default::default() };
+        rc.layer_res.insert(3, vec![1.0, 1.0, 2.0]);
+        rc.layer_cap.insert(3, vec![5.0, 5.0, 5.0]);
+        assert!(rc.same_corner_rc("t", 0, 1));
+        assert!(!rc.same_corner_rc("t", 0, 2), "a layer's resistance differs");
+        let hv = |h: f64| HV { h, v: h };
+        rc.wire_rc.insert(None, WireRc { signal_res: vec![hv(1.0), hv(3.0), hv(1.0)], signal_cap: vec![hv(1.0); 3], clk_res: vec![hv(1.0); 3], clk_cap: vec![hv(1.0); 3], ..Default::default() });
+        assert!(!rc.same_corner_rc("t", 0, 1), "the signal wire resistance differs");
+        rc.layer_cap.get_mut(&3).unwrap()[1] = -0.0;
+        rc.layer_cap.get_mut(&3).unwrap()[0] = 0.0;
+        assert!(!rc.same_corner_rc("t", 0, 1));
+        assert!(rc.same_corner_rc("t", 2, 2));
     }
 
     /// A value through a `float` parameter: 166666.6667 is stored as 166666.671875.
